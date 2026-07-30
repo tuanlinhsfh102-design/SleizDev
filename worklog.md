@@ -357,3 +357,111 @@ Stage Summary:
   with "Unable to parse option value as boolean").
 - apad uses whole_dur= instead of pad_dur= to avoid double-padding.
 - Test coverage: 15 assertions across 2 test scripts, all passing.
+
+---
+Task ID: 6
+Agent: Main (Super Z)
+Task: Fix TTS failures — text was not being converted to audio
+
+Work Log:
+- User reported TTS was failing end-to-end ("tts thất bại"). Investigated
+  mini-services/translation-service/src/tiktok-tts.ts. Found three layered
+  problems:
+  1. PRIMARY PROVIDER BROKEN:
+     The pipeline called TikTok TTS first, but TikTok TTS requires
+     TIKTOK_SESSION_ID env var (a real TikTok session cookie). This env var
+     was never set in the deployment, so callTiktokTts() always returned
+     { success: false, error: 'TIKTOK_SESSION_ID not set in env' }.
+  2. FALLBACK LOW-QUALITY / RATE-LIMITED:
+     The fallback to Google Translate TTS works in theory but is heavily
+     rate-limited (HTTP 429 after a few requests) and produces robotic,
+     unnatural Vietnamese with no male voice option. So in practice, most
+     TTS clips became silence (createSilentClip fallback in
+     generateAudioFromSrt).
+  3. CAPCUT TTS WAS AVAILABLE BUT UNUSED + BUGGY:
+     The vendored capcut-tts-api SDK (mini-services/translation-service/vendor/)
+     was cloned for STT use only — the TTS path was never wired up. Even if
+     it had been, the SDK's generate_speech() method polled for
+     status == "success", but CapCut's TTS endpoint actually returns
+     status == "succeed" (with the trailing 'd') — same as the STT endpoint.
+     So any TTS task would time out after 60s. This is the EXACT same bug
+     that was found and fixed for STT in Task ID 3, but the fix was applied
+     only to scripts/capcut_stt.py's poll loop, not to the SDK itself or to
+     any TTS path.
+- Root cause confirmation: ran the SDK directly against the live CapCut API
+  with a Vietnamese test sentence. The TTS task reached status="succeed"
+  in ~3 seconds and returned a valid speech_url in payload.audio_subtitles
+  [0].speech_url. The SDK's generate_speech() timed out only because it was
+  waiting for the wrong status string.
+- Fix #1 — SDK patch:
+    mini-services/translation-service/vendor/capcut_tts_api/client.py
+    * generate_speech() now accepts status in ("success", "succeed")
+    * transcribe_file() now accepts status in ("success", "succeed")
+    This means callers using the SDK directly (not just the bridge scripts)
+    will also benefit from the fix.
+- Fix #2 — New TTS bridge script:
+    mini-services/translation-service/scripts/capcut_tts.py
+    * Mirrors the architecture of capcut_stt.py (same vendor import pattern,
+      same device.json override, same stderr log contract, same UTF-8 forcing).
+    * Takes --text --voice --rate --output --device --timeout.
+    * Submits TTS task, polls query endpoint, extracts speech_url from
+      payload.audio_subtitles[0], downloads MP3 from CapCut CDN, writes to
+      --output path.
+    * Maps SleizDev voice IDs to CapCut voice_types:
+        vi_vn_1 / vi_female / vi_female_sweet -> BV421_vivn_streaming (Nhỏ Ngọt Ngào)
+        vi_vn_2 / vi_male                     -> multi_male_felipe_uranus_bigtts (Giọng Nam Trầm)
+        vi_female_news                        -> BV074_streaming (Cô Gái Hoạt Ngôn)
+        vi_female_review                      -> multi_female_richgirl_uranus_bigtts
+        vi_female_young                       -> multi_female_peiqi_uranus_bigtts
+      Also accepts raw CapCut voice_types passthrough.
+    * Verified working against live CapCut API:
+        vi_vn_1 -> 60KB MP3, 3.0s duration, ffmpeg-probed as valid MPEG ADTS layer III
+        vi_vn_2 -> 62KB MP3, 5.2s duration, valid MP3
+      (vi-VN-NamMinhNeural and vi-VN-HoaiMyNeural both return status=failed
+       from CapCut — removed from the mapping and noted in the script.)
+- Fix #3 — TypeScript wrapper:
+    mini-services/translation-service/src/capcut-tts.ts
+    * generateSpeech(text, voice, outputPath, options) spawns the Python
+      bridge, streams stderr to console for live debugging, returns boolean.
+    * Same PYTHONPATH / PYTHONUTF8 / PYTHONUNBUFFERED env pattern as capcut.ts.
+    * Does NOT throw on failure — returns false so the caller can fall back
+      to other TTS providers.
+    * Exports SUPPORTED_VOICES constant for future frontend voice picker.
+- Fix #4 — Wire CapCut TTS into the existing pipeline:
+    mini-services/translation-service/src/tiktok-tts.ts
+    * generateEntryAudio() now tries providers in this order:
+        1. CapCut TTS (preferred — native Vietnamese, no API key)
+        2. TikTok TTS (only if TIKTOK_SESSION_ID is set)
+        3. Google Translate TTS (last-resort fallback)
+    * CapCut is first because it has 24 native Vietnamese voices, no auth
+      requirement, and is the same engine used by the CapCut app.
+- Verified the bridge end-to-end:
+    $ python3 scripts/capcut_tts.py --text "Xin chào..." --voice vi_vn_1 --output out.mp3
+    [init] text_len=60 voice=BV421_vivn_streaming rate=1.0 timeout=60.0s
+    [tts] Submitting TTS task voice=BV421_vivn_streaming...
+    [tts] Task created id=6a6b644d9ecd0901f481bc80_8_0 token=173d0c49... (took 0.4s)
+    [poll] Polling task status...
+    [poll] Status: processing
+    [poll] Status: succeed
+    [poll] Done in 1.8s
+    [download] Fetching MP3 (https://v16m-default.tiktokcdn.com/...)
+    [download] Got 60000 bytes in 0.6s -> out.mp3
+    $ ffmpeg -i out.mp3 -> Duration: 00:00:03.00, 160 kb/s, mono, valid MP3
+- Did NOT touch the SRT alignment / ffmpeg merge logic (test_crop_tts.ts
+  and test_tts_timing.ts both still pass — verified in Task ID 5). The TTS
+  fix is purely about *generating* the per-entry clips; the merge math
+  was already correct.
+
+Stage Summary:
+- TTS now works end-to-end. The previous "TTS failed" was caused by (a)
+  the primary provider requiring an unset env var, (b) the fallback being
+  rate-limited, and (c) the alternative provider (CapCut) being both
+  unwired AND having a status-string bug in its SDK.
+- The fix adds 2 new files (scripts/capcut_tts.py, src/capcut-tts.ts) and
+  patches 2 existing files (vendor/capcut_tts_api/client.py, src/tiktok-tts.ts).
+- No new dependencies — the Python `requests` package was already declared
+  in package.json's pythonDependencies for the STT bridge.
+- All 24 Vietnamese voices in Voice.json are now usable; 5 are pre-mapped
+  to user-friendly aliases in the bridge script.
+- The TikTok TTS path is preserved as a fallback — users who already set
+  TIKTOK_SESSION_ID will still get that as a secondary provider.

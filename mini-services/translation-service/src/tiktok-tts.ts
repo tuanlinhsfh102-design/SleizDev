@@ -23,6 +23,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
 import { SrtEntry, timeToMs } from './srt-utils.js';
+import { generateSpeech as capcutGenerateSpeech } from './capcut-tts.js';
 
 const execAsync = promisify(exec);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
@@ -179,7 +180,18 @@ async function googleTranslateTts(text: string, lang = 'vi'): Promise<TiktokTtsR
 
 /**
  * Generate TTS audio for a single SRT entry.
- * Tries TikTok first, falls back to Google Translate TTS.
+ *
+ * Provider order (best to worst):
+ *   1. CapCut TTS  — 24 native Vietnamese voices, same engine as CapCut app.
+ *                    This is now the DEFAULT because the previous TikTok-first
+ *                    pipeline failed silently (TIKTOK_SESSION_ID env var was
+ *                    never set) and fell back to Google Translate TTS (robotic,
+ *                    heavily rate-limited). CapCut TTS also previously timed out
+ *                    due to a status-string mismatch bug in the vendored SDK
+ *                    (it polled for "success" but the API returns "succeed");
+ *                    that bug is now fixed in vendor/capcut_tts_api/client.py.
+ *   2. TikTok TTS  — only used if TIKTOK_SESSION_ID is set and CapCut fails.
+ *   3. Google Translate TTS — last-resort fallback (rate-limited, robotic).
  */
 async function generateEntryAudio(
   text: string,
@@ -190,8 +202,23 @@ async function generateEntryAudio(
   const cleanText = text.replace(/\n/g, ' ').replace(/\[.*?\]/g, '').trim();
   if (!cleanText) return false;
 
+  // 1. CapCut TTS (preferred — native Vietnamese voices, no API key needed)
+  try {
+    const ok = await capcutGenerateSpeech(cleanText, voice, outputPath, {
+      timeoutSeconds: 90,
+    });
+    if (ok && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100) {
+      return true;
+    }
+    console.warn('[tts] CapCut TTS did not produce a valid file, falling back');
+  } catch (err: any) {
+    console.warn(`[tts] CapCut TTS threw: ${err.message}`);
+  }
+
+  // 2. TikTok TTS (only works if TIKTOK_SESSION_ID is set)
   let result = await callTiktokTts(cleanText, voice);
 
+  // 3. Google Translate TTS (last-resort fallback)
   if (!result.success) {
     console.warn(`[tts] TikTok failed, using Google TTS: ${result.error}`);
     result = await googleTranslateTts(cleanText, 'vi');

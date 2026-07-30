@@ -371,7 +371,12 @@ class CapCutClient:
             query_tasks = (query_res.get("data") or {}).get("tasks") or []
             if query_tasks:
                 status = query_tasks[0].get("status")
-                if status == "success":
+                # CapCut's TTS API actually returns status="succeed" (with the
+                # trailing 'd'), NOT "success" — same as the STT endpoint.
+                # Accept both strings so we don't loop forever waiting for a
+                # status string that the API never emits. This was the root
+                # cause of every "TTS Task timed out" failure.
+                if status in ("success", "succeed"):
                     return query_res
                 elif status == "failed":
                     raise CapCutTaskError(f"TTS Task failed: {query_res}")
@@ -461,7 +466,9 @@ class CapCutClient:
             query_tasks = (query_res.get("data") or {}).get("tasks") or []
             if query_tasks:
                 status = query_tasks[0].get("status")
-                if status == "success":
+                # CapCut's STT API returns status="succeed" (with the trailing
+                # 'd'), NOT "success". Accept both strings for safety.
+                if status in ("success", "succeed"):
                     return query_res
                 elif status == "failed":
                     raise CapCutTaskError(f"STT Task failed: {query_res}")
