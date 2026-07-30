@@ -15,13 +15,16 @@ cd ../..
 
 ### 2. Environment Variables
 
-The project ships with **documented default credentials** that work out of
-the box for testing — you do NOT need to create `.env.local` to start the
-app. The translation service's env-loader will auto-inject them on first
-run if no `.env.local` is found.
+The project ships with **documented default credentials** committed to the
+repo (in `.env`) that work out of the box for testing — you do NOT need to
+create `.env.local` to start the app. Next.js auto-loads `.env` on startup,
+so the frontend works on first install with zero configuration. The
+translation-service's env-loader also injects these same defaults if no
+`.env.local` is found.
 
 **To use your own Supabase project** (recommended for production), create a
-`.env.local` file at the project root with these variables:
+`.env.local` file at the project root with your own values — Next.js loads
+`.env.local` AFTER `.env`, so your values override the defaults:
 
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
@@ -39,9 +42,10 @@ cp .env.example .env.local
 # Then edit .env.local with your Supabase project's credentials
 ```
 
-**Default credentials** (auto-injected by env-loader if `.env.local` is
-missing — these are the project's own Supabase instance, already public via
-this README, so safe to use for testing):
+**Default credentials** (committed in `.env`, also auto-injected by
+env-loader if `.env.local` is missing — these are the project's own
+Supabase instance, already public via this README, so safe to use for
+testing):
 
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://okeyouuilaldknazzhkx.supabase.co

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { ensureStorageBuckets } from '@/lib/storage-setup';
+import { supabaseUrl, supabaseServiceRoleKey } from '@/lib/env';
 
 // POST /api/setup-storage - auto-create Supabase storage buckets
 // This route uses the service role key (server-side only) to create buckets
@@ -24,18 +25,14 @@ export async function POST(_request: NextRequest) {
 
 // GET - check if storage is ready (uses service role key to list all buckets)
 export async function GET() {
-  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  if (!supabaseUrl || !serviceKey) {
-    return NextResponse.json({ error: 'Missing config' }, { status: 500 });
-  }
-
+  // supabaseUrl and supabaseServiceRoleKey come from @/lib/env, which falls
+  // back to documented defaults if env vars are missing. Previously this
+  // endpoint returned 500 "Missing config" on fresh installs.
   try {
     const res = await fetch(`${supabaseUrl}/storage/v1/bucket`, {
       headers: {
-        apikey: serviceKey,
-        Authorization: `Bearer ${serviceKey}`,
+        apikey: supabaseServiceRoleKey,
+        Authorization: `Bearer ${supabaseServiceRoleKey}`,
       },
     });
 

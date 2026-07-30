@@ -2,8 +2,7 @@
 // Called from Next.js client when app first loads
 // Tables still need manual SQL setup, but buckets are auto-created
 
-const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
-const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+import { supabaseUrl as SUPABASE_URL, supabaseServiceRoleKey as SERVICE_KEY } from "@/lib/env";
 
 const REQUIRED_BUCKETS = [
   { id: 'thumbnails', name: 'thumbnails', public: true },
