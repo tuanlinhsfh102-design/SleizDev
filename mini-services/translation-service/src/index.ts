@@ -16,7 +16,7 @@ import { nanoid } from 'nanoid';
 
 import { extractAudio, audioToSrt, getVideoDuration } from './capcut.js';
 import { translateSrt, generateMovieDescription, testGeminiApiKey } from './gemini.js';
-import { generateAudioFromSrt, dubVideo } from './tiktok-tts.js';
+import { generateAudioFromSrt, dubVideo, burnSubtitlesIntoVideo } from './tiktok-tts.js';
 import { JobStatus } from './types.js';
 
 const PORT = 3004;
@@ -359,23 +359,50 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
       }
     );
 
-    // Step 6: Dub the video
-    await updateJobProgress(jobId, movieId, 'dubbing', 80, 'Đang lồng tiếng vào video...', socket);
+    // Step 6: Dub the video (replace original audio with Vietnamese TTS audio)
+    await updateJobProgress(jobId, movieId, 'dubbing', 78, 'Đang lồng tiếng vào video...', socket);
     const dubbedVideoPath = path.join(workDir, 'dubbed.mp4');
     await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, 0.1);
 
-    // Upload dubbed video to Supabase storage
-    await updateJobProgress(jobId, movieId, 'dubbing', 88, 'Đang tải video lồng tiếng lên...', socket);
-    const dubbedVideoUrl = await uploadToSupabase(dubbedVideoPath, userId, movieId, 'dubbed-videos', 'dubbed.mp4');
+    // Step 6.5: Burn Vietnamese subtitles into the video (chèn chữ vào video)
+    // This renders the SRT text directly onto the video frames, so the
+    // subtitles are visible in any video player. The dubbed video from
+    // step 6 is the input; the output is a new video with both the
+    // Vietnamese TTS audio AND burned-in Vietnamese subtitles.
+    await updateJobProgress(jobId, movieId, 'dubbing', 84, 'Đang chèn phụ đề tiếng Việt vào video...', socket);
+    const srtPath = path.join(workDir, 'vietnamese.srt');
+    fs.writeFileSync(srtPath, vietnameseSrt, 'utf-8');
+    const finalVideoPath = path.join(workDir, 'final.mp4');
+    try {
+      await burnSubtitlesIntoVideo(dubbedVideoPath, srtPath, finalVideoPath);
+      console.log('[pipeline] Subtitle burn succeeded — uploading final video with subtitles');
+      // Upload the FINAL video (with subtitles) as the dubbed video
+      await updateJobProgress(jobId, movieId, 'dubbing', 88, 'Đang tải video hoàn chỉnh lên...', socket);
+      const finalVideoUrl = await uploadToSupabase(finalVideoPath, userId, movieId, 'dubbed-videos', 'dubbed.mp4');
 
-    // Update movie with dubbed video URL
-    await supabase
-      .from('movies')
-      .update({
-        dubbed_video_url: dubbedVideoUrl,
-        status: 'translating',
-      })
-      .eq('id', movieId);
+      // Update movie with final video URL (includes both TTS audio + burned subtitles)
+      await supabase
+        .from('movies')
+        .update({
+          dubbed_video_url: finalVideoUrl,
+          status: 'translating',
+        })
+        .eq('id', movieId);
+    } catch (burnErr: any) {
+      // Subtitle burn failed — fall back to the dubbed video WITHOUT subtitles
+      // so the user still has a usable video. Log the error so they can see
+      // what went wrong (usually a font or ffmpeg libass issue).
+      console.warn('[pipeline] Subtitle burn failed, uploading video without subtitles:', burnErr.message);
+      await updateJobProgress(jobId, movieId, 'dubbing', 88, 'Đang tải video lồng tiếng lên (không có phụ đề)...', socket);
+      const dubbedVideoUrl = await uploadToSupabase(dubbedVideoPath, userId, movieId, 'dubbed-videos', 'dubbed.mp4');
+      await supabase
+        .from('movies')
+        .update({
+          dubbed_video_url: dubbedVideoUrl,
+          status: 'translating',
+        })
+        .eq('id', movieId);
+    }
 
     // Step 7: Generate AI description
     await updateJobProgress(jobId, movieId, 'generating_description', 92, 'Đang tạo mô tả phim bằng AI (Gemini)...', socket);

@@ -801,3 +801,174 @@ export async function dubVideo(
     }
   }
 }
+
+// -------------------------------------------------------------------------
+// Burn Vietnamese subtitles into a dubbed video (chèn chữ vào video)
+// -------------------------------------------------------------------------
+
+/**
+ * Burn an SRT subtitle file into a video using ffmpeg's `subtitles` filter.
+ *
+ * The subtitles are rendered as hard-coded text on top of the video frames
+ * (not as a soft subtitle track). This means the subtitles will be visible
+ * in ANY video player, including ones that don't support SRT tracks.
+ *
+ * Styling:
+ *   - Font: Inter / Arial / DejaVu Sans (whichever is available)
+ *   - Size: scaled to video height (~5% of height)
+ *   - Position: bottom center, ~10% from bottom edge
+ *   - Colors: white text with semi-transparent black background box
+ *   - Bold for readability
+ *   - UTF-8 encoding (Vietnamese diacritics + Chinese characters supported)
+ *
+ * @param videoPath  Path to the input video (e.g. the dubbed video from dubVideo())
+ * @param srtPath     Path to the SRT file to burn in
+ * @param outputPath  Path for the output video with burned subtitles
+ *
+ * @returns void — throws on failure. The output file is a new MP4 with
+ *          subtitles rendered into the video frames.
+ */
+export async function burnSubtitlesIntoVideo(
+  videoPath: string,
+  srtPath: string,
+  outputPath: string
+): Promise<void> {
+  console.log(`[ffmpeg] Burning subtitles into video: ${path.basename(srtPath)}`);
+  console.log(`[ffmpeg]   input:  ${videoPath}`);
+  console.log(`[ffmpeg]   output: ${outputPath}`);
+
+  if (!fs.existsSync(videoPath)) {
+    throw new Error(`Input video not found: ${videoPath}`);
+  }
+  if (!fs.existsSync(srtPath)) {
+    throw new Error(`SRT file not found: ${srtPath}`);
+  }
+
+  // Probe video resolution to scale font size proportionally
+  const source = await getVideoResolution(videoPath);
+  const videoHeight = source?.height || 720; // default to 720p if probe fails
+  // Font size = ~5% of video height. For 720p → 36px, 1080p → 54px.
+  const fontSize = Math.round(videoHeight * 0.05);
+
+  // Build the subtitles filter with styling.
+  //
+  // The `subtitles` filter takes a path to an SRT file and renders the
+  // subtitles directly into the video frames. The `force_style` option
+  // accepts ASS-style override parameters:
+  //
+  //   FontName       — font family (must be installed on the system)
+  //   FontSize       — in pixels
+  //   PrimaryColour  — text color (ASS hex format: &H<AA><BB><GG><RR>&,
+  //                    where AA=alpha, BB=blue, GG=green, RR=red)
+  //   OutlineColour  — border/outline color
+  //   BackColour     — box background color (used with BorderStyle=3)
+  //   Bold           — 1 = bold, 0 = normal
+  //   Alignment      — Numpad-style: 2 = bottom-center
+  //   MarginV        — vertical margin from bottom (in pixels)
+  //   BorderStyle    — 1 = outline + drop shadow, 3 = opaque box
+  //
+  // Colors in ASS format: &H<AA><BB><GG><RR>&
+  //   White text:        &H00FFFFFF& (AA=00 opaque, BB=FF, GG=FF, RR=FF)
+  //   Black box:         &H80000000& (AA=80 semi-transparent, RGB=000000)
+  //   Black outline:     &H00000000& (AA=00 opaque, RGB=000000)
+  //
+  // We use BorderStyle=3 (opaque box) for maximum readability over any
+  // video background — the semi-transparent black box ensures white text
+  // is always legible.
+  //
+  // CRITICAL: The SRT path must be escaped for ffmpeg's filter parser.
+  // Backslashes and colons in the path need to be escaped, and on Windows
+  // the drive letter (C:) needs special handling. We use a relative path
+  // when possible to avoid these issues.
+  const srtAbsPath = path.resolve(srtPath);
+  const videoDir = path.dirname(path.resolve(videoPath));
+  let srtPathForFilter: string;
+  let needsChdir = false;
+  try {
+    // If the SRT is in the same dir as the video (or below it), use a
+    // relative path — avoids Windows drive-letter escaping issues.
+    const rel = path.relative(videoDir, srtAbsPath);
+    if (rel && !path.isAbsolute(rel)) {
+      srtPathForFilter = rel.replace(/\\/g, '/').replace(/:/g, '\\:');
+      needsChdir = true;
+    } else {
+      srtPathForFilter = srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    }
+  } catch {
+    srtPathForFilter = srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  }
+
+  const filterStyle = [
+    // FontName: try Inter first (modern, available on most systems),
+    // then fall back to DejaVu Sans (always available on Linux) and Arial
+    // (always available on Windows/macOS). The subtitles filter will use
+    // fontconfig/libass to resolve the font, so any of these will work.
+    `FontName=Inter\\,Arial\\,DejaVu Sans`,
+    `FontSize=${fontSize}`,
+    `PrimaryColour=&H00FFFFFF&`,  // white text, opaque
+    `OutlineColour=&H00000000&`,  // black outline
+    `BackColour=&H80000000&`,     // semi-transparent black box
+    `Bold=1`,
+    `Alignment=2`,                 // bottom center
+    `MarginV=${Math.round(videoHeight * 0.08)}`,  // ~8% from bottom
+    `BorderStyle=3`,               // opaque box (not just outline)
+    `Outline=2`,
+    `Shadow=0`,
+  ].join(',');
+
+  // Build the filter string. The subtitles filter syntax is:
+  //   subtitles=filename='path':force_style='style'
+  //
+  // Single quotes around the filename protect special chars; the inner
+  // escaping handles backslashes and colons.
+  const subtitleFilter = `subtitles=filename='${srtPathForFilter}':force_style='${filterStyle}'`;
+
+  const cmd =
+    `"${FFMPEG_PATH}" -i "${videoPath}" ` +
+    `-vf "${subtitleFilter}" ` +
+    `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +
+    `-c:a copy ` +  // just copy audio — no re-encoding needed
+    `-movflags +faststart "${outputPath}" -y`;
+
+  console.log(`[ffmpeg] Running subtitle burn (fontSize=${fontSize}, height=${videoHeight})...`);
+  const cwd = needsChdir ? videoDir : process.cwd();
+  try {
+    const { stderr } = await execAsync(cmd, {
+      maxBuffer: 200 * 1024 * 1024,
+      cwd,
+    });
+    if (stderr) {
+      const tail = stderr.split('\n').filter(Boolean).slice(-3).join('\n');
+      console.log('[ffmpeg] stderr tail:', tail);
+    }
+  } catch (error: any) {
+    console.error('[ffmpeg] Subtitle burn failed:', error.message);
+    // Fallback: try with absolute path + full escaping (in case the
+    // relative-path approach failed on a weird filesystem layout)
+    console.warn('[ffmpeg] Retrying with absolute path...');
+    const absFilter = `subtitles=filename='${srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:')}':force_style='${filterStyle}'`;
+    const fallbackCmd =
+      `"${FFMPEG_PATH}" -i "${videoPath}" ` +
+      `-vf "${absFilter}" ` +
+      `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +
+      `-c:a copy ` +
+      `-movflags +faststart "${outputPath}" -y`;
+    try {
+      await execAsync(fallbackCmd, { maxBuffer: 200 * 1024 * 1024 });
+    } catch (retryErr: any) {
+      throw new Error(
+        `Subtitle burn failed (both attempts). ` +
+          `First: ${error.message}. ` +
+          `Retry: ${retryErr.message}. ` +
+          `Check that ffmpeg has libass support (run: ffmpeg -filters | grep subtitles).`
+      );
+    }
+  }
+
+  if (!fs.existsSync(outputPath)) {
+    throw new Error('Subtitle burn failed - no output file');
+  }
+
+  const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
+  console.log(`[ffmpeg] Subtitle burn complete: ${sizeMb}MB -> ${path.basename(outputPath)}`);
+}
