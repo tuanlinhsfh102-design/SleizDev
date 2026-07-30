@@ -23,6 +23,7 @@ import {
   AlertCircle,
   Wand2,
   Copy,
+  Link as LinkIcon,
 } from 'lucide-react';
 import { Movie, TranslationJob, JOB_STATUS_LABELS } from '@/types';
 import { toast } from 'sonner';
@@ -41,6 +42,9 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
   const [loading, setLoading] = useState(true);
   const [videoUploading, setVideoUploading] = useState(false);
   const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [tiktokUrl, setTiktokUrl] = useState('');
+  const [tiktokImporting, setTiktokImporting] = useState(false);
+  const [tiktokImportStage, setTiktokImportStage] = useState('');
   const [activeTab, setActiveTab] = useState('upload');
   const [editedVietnameseSrt, setEditedVietnameseSrt] = useState('');
   const [editedDescription, setEditedDescription] = useState('');
@@ -272,6 +276,111 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       }
     } finally {
       setVideoUploading(false);
+    }
+  };
+
+  /**
+   * Import a TikTok video via URL. The server downloads the MP4 (using
+   * yt-dlp or a manual scraper), uploads it to Supabase storage at the
+   * same path as a regular upload, then triggers SRT extraction.
+   *
+   * The UI shows a live stage indicator (downloading → uploading →
+   * extracting SRT) so the user knows what's happening. The whole flow
+   * can take 30-120 seconds depending on video length and network.
+   */
+  const handleTiktokImport = async () => {
+    const url = tiktokUrl.trim();
+    if (!url) {
+      toast.error('Vui lòng dán link TikTok');
+      return;
+    }
+    if (!url.match(/^https?:\/\/(www\.|vt\.|vm\.)?tiktok\.com/i)) {
+      toast.error('URL phải là link TikTok (tiktok.com, vt.tiktok.com, vm.tiktok.com)');
+      return;
+    }
+
+    setTiktokImporting(true);
+    setTiktokImportStage('Đang tải video từ TikTok...');
+    let videoUploaded = false;
+
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Chưa đăng nhập');
+
+      // Step 1: Download the TikTok video server-side + upload to Supabase.
+      // The server returns the public URL of the uploaded video.
+      setTiktokImportStage('Đang tải video từ TikTok (yt-dlp + scraper)...');
+      const importResponse = await fetch('/api/import-tiktok', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, movieId, userId: user.id }),
+      });
+
+      const importResult = await importResponse.json();
+      if (!importResponse.ok || !importResult.success) {
+        throw new Error(importResult.error || 'Tải video TikTok thất bại');
+      }
+
+      videoUploaded = true;
+      setTiktokImportStage('Đã tải video. Đang trích xuất SRT...');
+
+      // Step 2: Update the movie record with the new video URL.
+      // (The import-tiktok route already uploads to Supabase, but we still
+      // need to update the movies table — the route doesn't do this so it
+      // can stay stateless and reusable.)
+      const { error: updateError } = await supabase
+        .from('movies')
+        .update({ video_url: importResult.videoUrl, status: 'draft' })
+        .eq('id', movieId);
+      if (updateError) throw updateError;
+
+      // Step 3: Trigger SRT extraction (same flow as file upload).
+      setTiktokImportStage('Đang nhận diện giọng nói thành SRT (CapCut API)...');
+      const extractResponse = await fetch('/api/extract-srt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          movieId,
+          movieTitle,
+          originalFileName: importResult.filename || 'tiktok-video.mp4',
+          videoUrl: importResult.videoUrl,
+        }),
+      });
+
+      const extractResult = await extractResponse.json();
+      if (!extractResponse.ok || !extractResult.success) {
+        throw new Error(extractResult.error || 'Tạo SRT thất bại');
+      }
+
+      // Step 4: Save the extracted SRT to the movie record.
+      const { error: srtUpdateError } = await supabase
+        .from('movies')
+        .update({ original_srt: extractResult.srt })
+        .eq('id', movieId);
+      if (srtUpdateError) throw srtUpdateError;
+
+      toast.success(
+        `Đã tải video TikTok và tạo SRT${importResult.title ? `: "${importResult.title.slice(0, 50)}"` : ''}`
+      );
+      setTiktokUrl('');
+      fetchMovie();
+      setActiveTab('original-srt');
+    } catch (error: any) {
+      const msg = error.message || 'Lỗi không xác định';
+      if (videoUploaded) {
+        // Video was downloaded + uploaded to Supabase, but SRT extraction failed.
+        // Don't lose the video — show a partial-success toast and switch to SRT tab.
+        toast.error(`Video đã tải lên nhưng tạo SRT thất bại: ${msg}`);
+        fetchMovie();
+        setActiveTab('original-srt');
+      } else {
+        // Download itself failed — most likely TikTok blocked the URL or
+        // the video is private/deleted. Show the full error.
+        toast.error(msg, { duration: 8000 });
+      }
+    } finally {
+      setTiktokImporting(false);
+      setTiktokImportStage('');
     }
   };
 
@@ -597,55 +706,115 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
                 Tải lên video
               </CardTitle>
               <CardDescription className="text-slate-400">
-                Tải lên video gốc để bắt đầu quá trình dịch và lồng tiếng
+                Tải lên video từ máy hoặc dán link TikTok để tự động tải về
               </CardDescription>
             </CardHeader>
             <CardContent>
               {!movie.video_url ? (
-                <div
-                  className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center hover:border-rose-500/50 transition-colors cursor-pointer"
-                  onClick={() => document.getElementById('video-input')?.click()}
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    e.currentTarget.classList.add('border-rose-500', 'bg-rose-500/5');
-                  }}
-                  onDragLeave={(e) => {
-                    e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
-                  }}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
-                    const file = e.dataTransfer.files[0];
-                    if (file) handleVideoUpload(file);
-                  }}
-                >
-                  {videoUploading ? (
-                    <>
-                      <Loader2 className="w-12 h-12 mx-auto mb-3 text-rose-400 animate-spin" />
-                      <p className="text-white font-medium">Đang tải lên...</p>
-                      <p className="text-xs text-slate-500 mt-1">Vui lòng đợi</p>
-                    </>
-                  ) : (
-                    <>
-                      <Video className="w-12 h-12 mx-auto mb-3 text-slate-600" />
-                      <p className="text-white font-medium mb-1">
-                        Kéo thả video hoặc click để chọn
-                      </p>
-                      <p className="text-xs text-slate-500">
-                        MP4, WebM, MOV - Tối đa 500MB
-                      </p>
-                    </>
-                  )}
-                  <input
-                    id="video-input"
-                    type="file"
-                    accept="video/*"
-                    className="hidden"
-                    onChange={(e) => {
-                      const file = e.target.files?.[0];
+                <div className="space-y-4">
+                  {/* File upload (drag-drop + click) */}
+                  <div
+                    className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center hover:border-rose-500/50 transition-colors cursor-pointer"
+                    onClick={() => document.getElementById('video-input')?.click()}
+                    onDragOver={(e) => {
+                      e.preventDefault();
+                      e.currentTarget.classList.add('border-rose-500', 'bg-rose-500/5');
+                    }}
+                    onDragLeave={(e) => {
+                      e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
+                    }}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
+                      const file = e.dataTransfer.files[0];
                       if (file) handleVideoUpload(file);
                     }}
-                  />
+                  >
+                    {videoUploading ? (
+                      <>
+                        <Loader2 className="w-12 h-12 mx-auto mb-3 text-rose-400 animate-spin" />
+                        <p className="text-white font-medium">Đang tải lên...</p>
+                        <p className="text-xs text-slate-500 mt-1">Vui lòng đợi</p>
+                      </>
+                    ) : (
+                      <>
+                        <Video className="w-12 h-12 mx-auto mb-3 text-slate-600" />
+                        <p className="text-white font-medium mb-1">
+                          Kéo thả video hoặc click để chọn
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          MP4, WebM, MOV - Tối đa 500MB
+                        </p>
+                      </>
+                    )}
+                    <input
+                      id="video-input"
+                      type="file"
+                      accept="video/*"
+                      className="hidden"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) handleVideoUpload(file);
+                      }}
+                    />
+                  </div>
+
+                  {/* OR divider */}
+                  <div className="flex items-center gap-3">
+                    <div className="flex-1 h-px bg-slate-700" />
+                    <span className="text-xs text-slate-500 uppercase tracking-wider">Hoặc</span>
+                    <div className="flex-1 h-px bg-slate-700" />
+                  </div>
+
+                  {/* TikTok URL import */}
+                  <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30">
+                    <div className="flex items-center gap-2 mb-3">
+                      <LinkIcon className="w-4 h-4 text-rose-400" />
+                      <p className="text-sm text-white font-medium">Tải video từ link TikTok</p>
+                    </div>
+                    <p className="text-xs text-slate-400 mb-3">
+                      Dán link TikTok (vt.tiktok.com/..., www.tiktok.com/@user/video/...) —
+                      server sẽ tự tải video, lưu vào storage, và trích xuất SRT.
+                    </p>
+                    {tiktokImporting ? (
+                      <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
+                        <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-white font-medium truncate">
+                            {tiktokImportStage || 'Đang xử lý...'}
+                          </p>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            Có thể mất 30-120 giây tùy độ dài video
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          value={tiktokUrl}
+                          onChange={(e) => setTiktokUrl(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && tiktokUrl.trim()) {
+                              e.preventDefault();
+                              handleTiktokImport();
+                            }
+                          }}
+                          placeholder="https://vt.tiktok.com/ZS42guBnS/"
+                          className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                          disabled={tiktokImporting || videoUploading}
+                        />
+                        <Button
+                          onClick={handleTiktokImport}
+                          disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
+                          className="bg-rose-600 hover:bg-rose-700 text-white"
+                        >
+                          <LinkIcon className="w-4 h-4 mr-1" />
+                          Tải video
+                        </Button>
+                      </div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-4">
