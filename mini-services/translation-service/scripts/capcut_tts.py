@@ -245,7 +245,41 @@ def generate_speech(
                     raise RuntimeError(f"Downloaded MP3 is suspiciously small ({byte_count} bytes)")
                 return byte_count
             if status == "failed":
-                err = query_tasks[0].get("error") or query_tasks[0].get("detail_info") or "TTS task failed"
+                task = query_tasks[0]
+                # CapCut's failure-response shape has drifted over the years
+                # (different versions return the reason in different fields).
+                # Probe every plausible field so the retry log has something
+                # concrete to act on, instead of the useless "TTS task failed:
+                # TTS task failed" double-fallback we used to get.
+                err_candidates = [
+                    task.get("error"),
+                    task.get("detail_info"),
+                    task.get("message"),
+                    task.get("fail_reason"),
+                    task.get("reason"),
+                    task.get("msg"),
+                    task.get("err_msg"),
+                ]
+                err = next(
+                    (
+                        str(c)
+                        for c in err_candidates
+                        if c not in (None, "", 0, False)
+                    ),
+                    "no error field in response (CapCut rejected without explanation)",
+                )
+                # Dump the full query_response (truncated) on a separate log
+                # line so we can actually see WHY CapCut said no. Without
+                # this we were retrying blindly 10x per slot, burning
+                # ~3 minutes of backoff per slot, with no signal about
+                # whether it was a voice issue, a device-ban, a quota
+                # exhaustion, or a server outage.
+                response_preview = json.dumps(query_response, ensure_ascii=False)[:1200]
+                log(
+                    "poll",
+                    f"FAILED voice={voice} text_len={len(text)} | "
+                    f"err={err} | response={response_preview}",
+                )
                 raise RuntimeError(f"TTS task failed: {err}")
         time.sleep(1.5)
 
