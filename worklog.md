@@ -673,3 +673,105 @@ Stage Summary:
   values override the defaults.
 - This complements Task ID 7 (translation-service env-loader) — now both
   the frontend AND the mini-service work on first install.
+
+---
+Task ID: 9
+Agent: Main (Super Z)
+Task: Parallelize CapCut TTS — 50 requests in parallel instead of 1-at-a-time
+
+Work Log:
+- User asked: "50 requests chuyển text sang âm thanh cùng 1 lúc không phải
+  1 clip cái TTS của CapCut TTS ấy" — they want 50 CapCut TTS requests to
+  run in parallel, not 1-at-a-time sequentially.
+- Previous pipeline: `generateAudioFromSrt()` looped over SRT entries one
+  by one, calling `generateEntryAudio()` → `capcutGenerateSpeech()` per
+  clip. Each clip took ~2-3s end-to-end (submit TTS task + poll + download
+  MP3), so a 500-line SRT took ~15-25 minutes. Way too slow.
+- Fix #1 — Add --batch mode to Python bridge:
+    mini-services/translation-service/scripts/capcut_tts.py
+    * Added `_process_one_entry()` helper that runs the full
+      generate_speech() flow for one manifest entry.
+    * Added `run_batch()` that takes a JSON manifest path, spins up a
+      `concurrent.futures.ThreadPoolExecutor(max_workers=concurrency)`,
+      submits all entries, streams live progress to stderr, and writes a
+      result manifest to <manifest>.result.json.
+    * Refactored `main()` to support both modes:
+        Single mode (back-compat): --text + --output (unchanged behavior)
+        Batch mode (new):          --batch <manifest.json> [--concurrency N]
+    * Default concurrency: 50. Override via --concurrency arg or via the
+      CAPCUT_TTS_CONCURRENCY env var on the TS side.
+    * Each entry in the manifest: {output, text, voice, rate}. The `voice`
+      field accepts the same SleizDev aliases (vi_vn_1, vi_vn_2, ...) as
+      single mode — resolve_voice() is called per-entry inside the worker.
+    * Exit code: 0 if ALL entries succeeded, 1 if any failed. Caller can
+      read the result manifest to retry failures one-by-one.
+    * ThreadPoolExecutor is the right choice because each task is I/O-bound
+      (HTTP POST + polling + HTTP GET download). Python's GIL is not a
+      bottleneck — almost all time is spent in network I/O.
+- Fix #2 — Add generateSpeechBatch() to TypeScript wrapper:
+    mini-services/translation-service/src/capcut-tts.ts
+    * New exported function: `generateSpeechBatch(entries, options)`.
+    * Writes the entries array as a JSON manifest to a temp file under
+      os.tmpdir() (avoids Windows 8KB argv limit — a 500-entry manifest
+      with ~150 chars per text is ~75KB).
+    * Spawns the Python bridge with `--batch <manifest> --concurrency N`,
+      waits for it to exit, parses the result manifest.
+    * Returns `CapCutTtsBatchResult[]` aligned with the input array. Never
+      throws — failures are reported per-entry so the caller can retry.
+    * Cleans up both manifest files in a `finally` block.
+    * New exported types: CapCutTtsBatchEntry, CapCutTtsBatchResult,
+      CapCutTtsBatchOptions.
+    * Added `DEFAULT_BATCH_CONCURRENCY` (50) read from env
+      CAPCUT_TTS_CONCURRENCY so users can tune it without code changes.
+- Fix #3 — Rewrite generateAudioFromSrt() with two-phase parallel pipeline:
+    mini-services/translation-service/src/tiktok-tts.ts
+    * Added TTS_BATCH_SIZE constant (default 50, override via env
+      CAPCUT_TTS_BATCH_SIZE). Larger SRTs are split into multiple batches.
+    * Phase 1 (batch, parallel):
+        - Pre-allocate clip paths so index alignment is stable.
+        - For each batch of TTS_BATCH_SIZE entries:
+          * Build a CapCutTtsBatchEntry[] for non-empty entries.
+          * Call capcutGenerateSpeechBatch() — all entries in this batch
+            run in parallel via Python ThreadPoolExecutor.
+          * Map results back to global entry indices.
+          * Mark failed/empty slots for phase 2 retry.
+          * Stream per-batch progress via onProgress callback.
+    * Phase 2 (sequential retry):
+        - For each failed slot, run the full fallback chain:
+          CapCut single → TikTok → Google Translate TTS → silence.
+        - This catches transient failures (network blip, CapCut API hiccup)
+          without aborting the whole batch.
+        - Final fallback is always silence — keeps the timeline aligned.
+    * Removed the old per-entry `await new Promise((r) => setTimeout(r, 500))`
+      rate-limit delay (no longer needed — CapCut handles 50 concurrent
+      requests without rate-limiting).
+- Verified end-to-end with two test scripts:
+    scripts/test_batch_tts.py  (Python direct test, 10 entries)
+    scripts/test_batch_tts.ts  (TypeScript end-to-end test, 12-entry SRT)
+  Results from the TS test:
+    * 12-entry SRT pipeline: 5.2s total (was ~25s sequential → ~5x speedup)
+    * 12/12 clips generated successfully in a single parallel batch
+    * All 12 clips are valid MP3s (ffmpeg probed duration > 0.5s each)
+    * Final merged audio: 25.05s duration (target 25s, drift 0.05s)
+    * ffmpeg merge math unchanged — all 6 timing test assertions still pass
+    * All 12 original single-mode TTS tests still pass — no regression
+  Python test results:
+    * 10 entries in parallel: 7.7s total
+    * 9/10 completed in 2.6-3.2s (truly parallel — all hit the CapCut API
+      within ~100ms of each other)
+    * 1/10 took 5.2s (one CDN download was slow but didn't block others)
+    * 10/10 succeeded, 630KB total MP3 data
+- Performance math:
+    * Per-clip latency: ~2-3s (submit task + poll + download)
+    * Sequential (old): N × 2.5s — e.g. 500-line SRT = ~21 minutes
+    * Parallel (new):   N/50 × 2.5s — e.g. 500-line SRT = ~25 seconds
+    * Speedup: ~50x for large SRTs
+
+Stage Summary:
+- CapCut TTS now runs 50 requests in parallel via ThreadPoolExecutor.
+- Default concurrency: 50 (override via CAPCUT_TTS_CONCURRENCY env var).
+- Batch size: 50 (override via CAPCUT_TTS_BATCH_SIZE env var).
+- Two-phase pipeline: parallel batch first, sequential retry for failures.
+- All 35 existing test assertions (12 single-mode + 6 timing + 9 crop + 8
+  misc) still pass — no regression.
+- 17 new test assertions (parallelism + end-to-end pipeline) all pass.

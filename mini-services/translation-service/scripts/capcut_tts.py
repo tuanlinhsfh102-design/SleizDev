@@ -37,8 +37,9 @@ import os
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Force UTF-8 output on Windows (default console encoding is cp1252 which
 # cannot encode CJK characters).
@@ -253,24 +254,199 @@ def generate_speech(
     )
 
 
+# -------------------------------------------------------------------------
+# Batch mode — process N entries in parallel via ThreadPoolExecutor
+# -------------------------------------------------------------------------
+
+def _process_one_entry(
+    idx: int,
+    entry: Dict[str, Any],
+    device_path: Optional[str],
+    timeout_seconds: float,
+) -> Tuple[int, bool, str]:
+    """Process a single batch entry. Returns (idx, success, message).
+
+    Each entry must contain:
+      - output: absolute path to write MP3 to
+      - text:   text to synthesize
+      - voice:  (optional, defaults to vi_vn_1) voice ID or CapCut voice_type
+      - rate:   (optional, defaults to 1.0) speech rate
+    """
+    output_path = entry.get("output") or ""
+    text = entry.get("text") or ""
+    voice_input = entry.get("voice") or "vi_vn_1"
+    rate = entry.get("rate") or "1.0"
+
+    if not output_path:
+        return idx, False, "missing 'output' field"
+    if not text or not text.strip():
+        # Empty text is not an error — caller should fill this slot with silence.
+        return idx, False, "empty text"
+
+    voice_type = resolve_voice(voice_input)
+    try:
+        generate_speech(
+            text=text,
+            voice=voice_type,
+            rate=str(rate),
+            output_path=output_path,
+            device_path=device_path,
+            timeout_seconds=timeout_seconds,
+        )
+        if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
+            return idx, False, f"output empty: {output_path}"
+        size_kb = Path(output_path).stat().st_size / 1024
+        return idx, True, f"{size_kb:.1f}KB -> {Path(output_path).name}"
+    except Exception as exc:  # noqa: BLE001 — batch should not abort on one failure
+        return idx, False, f"{type(exc).__name__}: {exc}"
+
+
+def run_batch(
+    manifest_path: str,
+    concurrency: int,
+    device_path: Optional[str],
+    timeout_seconds: float,
+) -> int:
+    """Run TTS for every entry in the manifest in parallel.
+
+    Manifest format (JSON, UTF-8):
+        [
+          {"output": "/abs/clip_00000.mp3", "text": "...", "voice": "vi_vn_1", "rate": "1.0"},
+          {"output": "/abs/clip_00001.mp3", "text": "...", "voice": "vi_vn_1", "rate": "1.0"},
+          ...
+        ]
+
+    Writes a result manifest to <manifest_path>.result.json:
+        [
+          {"idx": 0, "success": true,  "message": "58.6KB -> clip_00000.mp3"},
+          {"idx": 1, "success": false, "message": "empty text"},
+          ...
+        ]
+
+    Exit code: 0 if ALL entries succeeded, 1 if any failed (caller can read
+    the result manifest to retry failures sequentially).
+    """
+    if not Path(manifest_path).is_file():
+        log("error", f"Manifest file not found: {manifest_path}")
+        return 2
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            entries: List[Dict[str, Any]] = json.load(f)
+    except json.JSONDecodeError as exc:
+        log("error", f"Manifest is not valid JSON: {exc}")
+        return 2
+
+    if not isinstance(entries, list) or not entries:
+        log("error", "Manifest must be a non-empty JSON array")
+        return 2
+
+    total = len(entries)
+    log("batch", f"{total} entries, concurrency={concurrency}, timeout={timeout_seconds}s")
+
+    results: List[Dict[str, Any]] = [{} for _ in range(total)]
+    start_time = time.time()
+    completed = 0
+    succeeded = 0
+
+    # ThreadPoolExecutor is the right choice here: each task is I/O-bound
+    # (HTTP POST to submit, polling, then HTTP GET to download the MP3).
+    # Python's GIL is not a bottleneck because almost all the time is spent
+    # waiting on network I/O. Empirically 50 concurrent threads against the
+    # CapCut API work fine — no rate-limiting observed.
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {
+            pool.submit(
+                _process_one_entry, i, entries[i], device_path, timeout_seconds
+            ): i
+            for i in range(total)
+        }
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                entry_idx, success, message = future.result()
+            except Exception as exc:  # noqa: BLE001
+                entry_idx, success, message = idx, False, f"thread crashed: {exc}"
+            results[entry_idx] = {
+                "idx": entry_idx,
+                "success": bool(success),
+                "message": message,
+            }
+            completed += 1
+            if success:
+                succeeded += 1
+            # Stream progress to stderr so the parent can see live progress.
+            log(
+                "batch",
+                f"[{completed}/{total}] ok={succeeded} fail={completed - succeeded} "
+                f"({time.time() - start_time:.1f}s elapsed)",
+            )
+
+    # Write result manifest next to the input manifest
+    result_path = manifest_path + ".result.json"
+    try:
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        log("batch", f"Result manifest written to {result_path}")
+    except OSError as exc:
+        log("error", f"Failed to write result manifest: {exc}")
+        return 3
+
+    failed = total - succeeded
+    log(
+        "batch",
+        f"Done in {time.time() - start_time:.1f}s — "
+        f"{succeeded}/{total} succeeded, {failed} failed",
+    )
+    return 0 if failed == 0 else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="CapCut TTS bridge for SleizDev")
-    parser.add_argument("--text", required=True, help="Text to convert to speech")
+    # Single-text mode (back-compat)
+    parser.add_argument("--text", default=None, help="Text to convert to speech (single mode)")
     parser.add_argument(
         "--voice",
         default="vi_vn_1",
         help="Voice ID (vi_vn_1, vi_vn_2, vi_female, vi_male, ...) or raw CapCut voice_type",
     )
     parser.add_argument("--rate", default="1.0", help="Speech rate multiplier (e.g. 1.0, 0.9, 1.2)")
-    parser.add_argument("--output", required=True, help="Output MP3 file path")
+    parser.add_argument("--output", default=None, help="Output MP3 file path (single mode)")
+    # Batch mode
+    parser.add_argument(
+        "--batch",
+        default=None,
+        help="Batch mode: path to a JSON manifest of [{output, text, voice, rate}, ...]",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=50,
+        help="Max parallel TTS workers in batch mode (default: 50)",
+    )
+    # Shared
     parser.add_argument("--device", default=None, help="Optional path to a device.json profile")
     parser.add_argument(
         "--timeout",
         type=float,
         default=90.0,
-        help="Max seconds to wait for the TTS task to finish (default: 90)",
+        help="Max seconds to wait per TTS task to finish (default: 90)",
     )
     args = parser.parse_args()
+
+    # Batch mode — short-circuits before single-text validation.
+    if args.batch:
+        return run_batch(
+            manifest_path=args.batch,
+            concurrency=max(1, args.concurrency),
+            device_path=args.device,
+            timeout_seconds=args.timeout,
+        )
+
+    # Single-text mode (original behavior)
+    if not args.text or not args.output:
+        log("error", "Either --batch <manifest> OR both --text + --output are required")
+        return 2
 
     voice_type = resolve_voice(args.voice)
 

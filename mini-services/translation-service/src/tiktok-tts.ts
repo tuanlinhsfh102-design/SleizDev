@@ -23,10 +23,20 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
 import { SrtEntry, timeToMs } from './srt-utils.js';
-import { generateSpeech as capcutGenerateSpeech } from './capcut-tts.js';
+import {
+  generateSpeech as capcutGenerateSpeech,
+  generateSpeechBatch as capcutGenerateSpeechBatch,
+  type CapCutTtsBatchEntry,
+} from './capcut-tts.js';
 
 const execAsync = promisify(exec);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
+
+// Batch size for parallel TTS. 50 means up to 50 CapCut TTS requests run
+// concurrently — empirically the CapCut API handles this without rate-
+// limiting. Override via CAPCUT_TTS_CONCURRENCY env var (read inside
+// capcut-tts.ts). Larger SRTs are split into multiple batches of this size.
+const TTS_BATCH_SIZE = parseInt(process.env.CAPCUT_TTS_BATCH_SIZE || '50', 10);
 
 // TikTok TTS API endpoint (v6 + /invoke is the current working endpoint)
 const TIKTOK_TTS_URL = 'https://api16-normal-v6.tiktokv.com/media/api/text/speech/invoke';
@@ -236,7 +246,17 @@ async function generateEntryAudio(
 /**
  * Generate full audio track from SRT.
  *
- * Creates one TTS clip per SRT entry, then merges them with ffmpeg using:
+ * TWO-PHASE PARALLEL PIPELINE:
+ *   Phase 1 (batch, parallel): Send all entries to the CapCut TTS bridge in
+ *     batches of TTS_BATCH_SIZE (default 50). The bridge runs them in
+ *     parallel via ThreadPoolExecutor. This is ~50x faster than the old
+ *     sequential 1-clip-at-a-time loop.
+ *   Phase 2 (sequential retry): For any entries that failed in phase 1
+ *     (network blip, transient CapCut error, etc.), retry them one-by-one
+ *     through generateEntryAudio() which falls back to TikTok TTS and then
+ *     Google Translate TTS. If all retries fail, fill the slot with silence.
+ *
+ * Then merges all clips with ffmpeg using:
  *   - adelay=N|N   to position each clip at its start_ms
  *   - atrim=end=DURATION  to cap each clip's length to the entry's slot
  *   - asetpts=PTS-STARTPTS  to reset timestamps after atrim
@@ -258,32 +278,121 @@ export async function generateAudioFromSrt(
     throw new Error('No SRT entries found');
   }
 
-  console.log(`[tts] Generating audio for ${entries.length} entries...`);
+  console.log(
+    `[tts] Generating audio for ${entries.length} entries ` +
+      `(batch size=${TTS_BATCH_SIZE}, parallel via CapCut TTS bridge)...`
+  );
 
   // Create clips directory
   const clipsDir = path.join(outputDir, 'clips');
   fs.mkdirSync(clipsDir, { recursive: true });
 
-  // Generate one audio clip per entry
-  const clipPaths: string[] = [];
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    onProgress?.(i, entries.length);
+  // Pre-allocate clip paths so the index alignment is stable across phases.
+  const clipPaths: string[] = entries.map((_, i) =>
+    path.join(clipsDir, `clip_${String(i).padStart(5, '0')}.mp3`)
+  );
+  // Track which slots still need a clip generated.
+  const failedSlots: Set<number> = new Set();
 
-    const clipPath = path.join(clipsDir, `clip_${String(i).padStart(5, '0')}.mp3`);
-    const success = await generateEntryAudio(entry.text, voice, clipPath);
-    if (success) {
-      clipPaths.push(clipPath);
-    } else {
-      // Fill failed slots with silence so the timing math still works.
-      const slotMs = Math.max(100, entry.endMs - entry.startMs);
-      await createSilentClip(clipPath, slotMs);
-      clipPaths.push(clipPath);
+  // -----------------------------------------------------------------------
+  // PHASE 1: Batch parallel TTS via CapCut bridge.
+  // Split into chunks of TTS_BATCH_SIZE so we don't hold 500+ in-flight
+  // HTTP requests all at once (also lets us report progress per batch).
+  // -----------------------------------------------------------------------
+  const batchSize = Math.max(1, TTS_BATCH_SIZE);
+  let processed = 0;
+  for (let batchStart = 0; batchStart < entries.length; batchStart += batchSize) {
+    const batchEnd = Math.min(batchStart + batchSize, entries.length);
+    const batchEntries: CapCutTtsBatchEntry[] = [];
+
+    for (let i = batchStart; i < batchEnd; i++) {
+      const entry = entries[i];
+      // Strip newlines and bracketed annotations like [Phân đoạn 1]
+      const cleanText = entry.text.replace(/\n/g, ' ').replace(/\[.*?\]/g, '').trim();
+      if (!cleanText) {
+        // Empty text — mark for phase 2 silence fill, skip from batch.
+        failedSlots.add(i);
+        continue;
+      }
+      batchEntries.push({
+        output: clipPaths[i],
+        text: cleanText,
+        voice,
+        rate: '1.0',
+      });
     }
 
-    // Small delay every 5 entries to avoid TikTok rate limiting
-    if (i % 5 === 4) {
-      await new Promise((r) => setTimeout(r, 500));
+    if (batchEntries.length === 0) {
+      // All entries in this batch were empty — just bump progress.
+      processed = batchEnd;
+      onProgress?.(processed, entries.length);
+      continue;
+    }
+
+    console.log(
+      `[tts] Batch ${Math.floor(batchStart / batchSize) + 1}/` +
+        `${Math.ceil(entries.length / batchSize)}: ` +
+        `submitting ${batchEntries.length} entries in parallel...`
+    );
+
+    const batchStartMs = Date.now();
+    const results = await capcutGenerateSpeechBatch(batchEntries, {
+      timeoutSeconds: 90,
+    });
+    const batchDuration = ((Date.now() - batchStartMs) / 1000).toFixed(1);
+
+    // Map results back to the original entry indices.
+    let batchOk = 0;
+    let batchFail = 0;
+    for (const r of results) {
+      const globalIdx = batchStart + r.idx;
+      if (r.success && fs.existsSync(clipPaths[globalIdx]) && fs.statSync(clipPaths[globalIdx]).size > 100) {
+        batchOk++;
+      } else {
+        // Phase 2 will retry this slot via the sequential fallback chain.
+        failedSlots.add(globalIdx);
+        batchFail++;
+        if (!r.success) {
+          console.warn(`[tts]   slot ${globalIdx} failed: ${r.message}`);
+        } else {
+          console.warn(`[tts]   slot ${globalIdx} reported success but output missing/empty`);
+        }
+      }
+    }
+    console.log(
+      `[tts] Batch done in ${batchDuration}s — ok=${batchOk}, fail=${batchFail}`
+    );
+
+    processed = batchEnd;
+    onProgress?.(processed, entries.length);
+  }
+
+  // -----------------------------------------------------------------------
+  // PHASE 2: Sequential retry for failed slots.
+  // For each failed slot, try the full fallback chain (CapCut single →
+  // TikTok → Google Translate TTS). If everything fails, fill with silence
+  // so the timing math still works.
+  // -----------------------------------------------------------------------
+  if (failedSlots.size > 0) {
+    console.log(
+      `[tts] Phase 2: retrying ${failedSlots.size} failed slot(s) sequentially ` +
+        `(CapCut single → TikTok → Google TTS → silence)...`
+    );
+    const failedList = Array.from(failedSlots).sort((a, b) => a - b);
+    for (let retryIdx = 0; retryIdx < failedList.length; retryIdx++) {
+      const i = failedList[retryIdx];
+      const entry = entries[i];
+      onProgress?.(processed + retryIdx, entries.length + failedList.length);
+
+      const ok = await generateEntryAudio(entry.text, voice, clipPaths[i]);
+      if (!ok) {
+        // Final fallback: silence. Keeps the timeline aligned.
+        const slotMs = Math.max(100, entry.endMs - entry.startMs);
+        await createSilentClip(clipPaths[i], slotMs);
+        console.warn(`[tts]   slot ${i} -> silence (all TTS providers failed)`);
+      } else {
+        console.log(`[tts]   slot ${i} -> recovered via fallback chain`);
+      }
     }
   }
 

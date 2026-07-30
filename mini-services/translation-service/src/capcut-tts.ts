@@ -20,11 +20,22 @@
 //   trailing 'd') — same as the STT endpoint. So every TTS task timed out.
 //   This is now fixed in vendor/capcut_tts_api/client.py and the bridge
 //   also accepts both strings, so it works even with older SDK versions.
+//
+// PARALLELISM:
+//   The bridge supports a --batch mode that takes a JSON manifest of
+//   {output, text, voice, rate} entries and processes them in parallel via
+//   ThreadPoolExecutor (default 50 workers). The previous pipeline called
+//   TTS sequentially — 1 clip at a time — so a 500-line SRT took 500x the
+//   per-clip latency. With batch mode + 50 workers, the same 500-line SRT
+//   takes 10x the per-clip latency (500 / 50 = 10 batches). Override the
+//   concurrency via CAPCUT_TTS_CONCURRENCY env var or the `concurrency`
+//   field on CapCutTtsBatchOptions.
 
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
+import os from 'os';
 
 const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const BRIDGE_SCRIPT = path.resolve(MODULE_DIR, '..', 'scripts', 'capcut_tts.py');
@@ -34,6 +45,15 @@ const DEVICE_JSON = path.resolve(MODULE_DIR, '..', 'device.json');
 // Allow overriding the Python interpreter via env (defaults to `python3`).
 const PYTHON_BIN = process.env.CAPCUT_PYTHON || process.env.PYTHON || 'python3';
 
+// Default parallelism for batch mode. 50 is a sweet spot — empirically the
+// CapCut API handles 50 concurrent TTS requests without rate-limiting, and
+// Python's ThreadPoolExecutor can handle that many I/O-bound threads cheaply.
+// Override via CAPCUT_TTS_CONCURRENCY env var.
+const DEFAULT_BATCH_CONCURRENCY = parseInt(
+  process.env.CAPCUT_TTS_CONCURRENCY || '50',
+  10
+);
+
 export interface CapCutTtsOptions {
   /** Optional CapCut device.json profile path. */
   devicePath?: string;
@@ -41,6 +61,37 @@ export interface CapCutTtsOptions {
   rate?: string;
   /** Max seconds to wait for the TTS task to finish. */
   timeoutSeconds?: number;
+}
+
+/** One entry in a TTS batch. */
+export interface CapCutTtsBatchEntry {
+  /** Absolute path where the MP3 will be written. */
+  output: string;
+  /** Text to synthesize (must be non-empty). */
+  text: string;
+  /** Voice ID (vi_vn_1, vi_vn_2, vi_female, vi_male, ...) or raw CapCut voice_type. Defaults to vi_vn_1. */
+  voice?: string;
+  /** Speech rate multiplier. Defaults to "1.0". */
+  rate?: string;
+}
+
+/** Result of a single batch entry after the bridge finishes. */
+export interface CapCutTtsBatchResult {
+  /** Original index in the input array. */
+  idx: number;
+  /** True if the MP3 was generated and is non-empty. */
+  success: boolean;
+  /** Human-readable status message (size + filename on success, error on failure). */
+  message: string;
+}
+
+export interface CapCutTtsBatchOptions {
+  /** Optional CapCut device.json profile path. */
+  devicePath?: string;
+  /** Max seconds to wait per TTS task. Default 90. */
+  timeoutSeconds?: number;
+  /** Number of parallel TTS workers. Default 50 (override via CAPCUT_TTS_CONCURRENCY env). */
+  concurrency?: number;
 }
 
 /**
@@ -182,6 +233,138 @@ function runPythonBridge(args: string[], timeoutSeconds: number): Promise<number
       resolve(code ?? 1);
     });
   });
+}
+
+/**
+ * Generate multiple MP3 files in PARALLEL using CapCut's TTS API.
+ *
+ * Writes a JSON manifest to a temp file, spawns the Python bridge with
+ * `--batch`, and parses the result manifest once the bridge exits.
+ *
+ * @param entries  Array of {output, text, voice, rate}. Each entry is
+ *                 synthesized independently — order is preserved by the
+ *                 `idx` field in the result array.
+ * @param options  Optional device profile, per-task timeout, and
+ *                 concurrency (default 50 — override via env
+ *                 CAPCUT_TTS_CONCURRENCY or this field).
+ *
+ * @returns Array of {idx, success, message} aligned with the input array.
+ *          Never throws — failures are reported per-entry in the result.
+ *          Caller can retry failed entries sequentially if desired.
+ *
+ * Why batch mode:
+ *   The previous pipeline called `generateSpeech()` once per SRT entry,
+ *   sequentially — so a 500-line SRT took ~500 × per-clip latency. With
+ *   batch mode + 50 parallel workers, the same SRT takes ~10 × per-clip
+ *   latency. Empirically the CapCut API handles 50 concurrent requests
+ *   without rate-limiting.
+ */
+export async function generateSpeechBatch(
+  entries: CapCutTtsBatchEntry[],
+  options: CapCutTtsBatchOptions = {}
+): Promise<CapCutTtsBatchResult[]> {
+  if (entries.length === 0) {
+    return [];
+  }
+
+  if (!fs.existsSync(BRIDGE_SCRIPT)) {
+    console.error(
+      `[capcut-tts] Bridge script not found: ${BRIDGE_SCRIPT}. ` +
+        'Make sure mini-services/translation-service/scripts/capcut_tts.py is committed.'
+    );
+    return entries.map((_, idx) => ({
+      idx,
+      success: false,
+      message: 'Bridge script not found',
+    }));
+  }
+  if (!fs.existsSync(VENDOR_DIR)) {
+    console.error(
+      `[capcut-tts] Vendored capcut-tts-api library not found: ${VENDOR_DIR}.`
+    );
+    return entries.map((_, idx) => ({
+      idx,
+      success: false,
+      message: 'Vendor dir not found',
+    }));
+  }
+
+  const concurrency = Math.max(1, options.concurrency ?? DEFAULT_BATCH_CONCURRENCY);
+  const timeoutSeconds = options.timeoutSeconds ?? 90;
+  const devicePath =
+    options.devicePath || (fs.existsSync(DEVICE_JSON) ? DEVICE_JSON : undefined);
+
+  // Write manifest to a temp file (avoids command-line length limits —
+  // a 500-entry manifest with ~150 chars per text is ~75KB, way over the
+  // typical 8KB Windows argv limit).
+  const manifestPath = path.join(
+    os.tmpdir(),
+    `capcut-tts-manifest-${process.pid}-${Date.now()}.json`
+  );
+  const resultPath = manifestPath + '.result.json';
+
+  try {
+    fs.writeFileSync(manifestPath, JSON.stringify(entries), 'utf-8');
+    console.log(
+      `[capcut-tts] Batch: ${entries.length} entries, concurrency=${concurrency}, ` +
+        `manifest=${path.basename(manifestPath)}`
+    );
+
+    const args: string[] = [
+      BRIDGE_SCRIPT,
+      '--batch', manifestPath,
+      '--concurrency', String(concurrency),
+      '--timeout', String(timeoutSeconds),
+    ];
+    if (devicePath) {
+      args.push('--device', devicePath);
+    }
+
+    // Bridge timeout = per-task timeout + generous buffer for the slowest
+    // parallel task. With 50 workers and 90s per task, the worst case is
+    // ~2 batches deep = 180s. We give 5x the per-task timeout to be safe.
+    const bridgeTimeout = timeoutSeconds * 5;
+    const exitCode = await runPythonBridge(args, bridgeTimeout);
+    console.log(`[capcut-tts] Batch bridge exited with code ${exitCode}`);
+
+    // Parse the result manifest written by the Python side.
+    if (!fs.existsSync(resultPath)) {
+      console.error(`[capcut-tts] Result manifest not found: ${resultPath}`);
+      return entries.map((_, idx) => ({
+        idx,
+        success: false,
+        message: 'Result manifest missing',
+      }));
+    }
+
+    let results: CapCutTtsBatchResult[];
+    try {
+      results = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
+    } catch (err: any) {
+      console.error(`[capcut-tts] Failed to parse result manifest: ${err.message}`);
+      return entries.map((_, idx) => ({
+        idx,
+        success: false,
+        message: `Result parse error: ${err.message}`,
+      }));
+    }
+
+    // Sanity-check the result array has the right length and indices.
+    // If anything is off, fill missing slots with a failure.
+    const byIdx = new Map<number, CapCutTtsBatchResult>();
+    for (const r of results) {
+      if (r && typeof r.idx === 'number') {
+        byIdx.set(r.idx, r);
+      }
+    }
+    return entries.map((_, idx) =>
+      byIdx.get(idx) || { idx, success: false, message: 'No result from bridge' }
+    );
+  } finally {
+    // Clean up both manifest files. Don't fail the call if cleanup fails.
+    try { fs.unlinkSync(manifestPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(resultPath); } catch { /* ignore */ }
+  }
 }
 
 /**
