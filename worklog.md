@@ -878,3 +878,145 @@ Stage Summary:
     CAPCUT_TTS_CONCURRENCY=50  (parallel workers per batch)
     CAPCUT_TTS_BATCH_SIZE=50   (entries per batch)
 - All 42 test assertions pass (35 existing + 7 new retry logic).
+
+---
+Task ID: 11
+Agent: Main (Super Z)
+Task: Fix TTSInvalidText (err_code=40402002) — Vietnamese voice can't synthesize Chinese text
+
+Work Log:
+- User reported TTS failure with log:
+    [poll] FAILED voice=BV421_vivn_streaming text_len=12 | err=TTSInvalidText | err_code=40402002
+    [retry] slot 5 attempt 4/11 failed (InvalidTextError: CapCut rejected text as invalid
+            (err_code=40402002): voice=BV421_vivn_streaming text_len=12 text='而且他也掌握着双奥运出行')
+- Root cause investigation:
+  * BV421_vivn_streaming is a VIETNAMESE voice (Nhỏ Ngọt Ngào).
+  * The text '而且他也掌握着双奥运出行' is CHINESE (CJK characters).
+  * CapCut voices are language-locked: a Vietnamese voice CANNOT synthesize
+    Chinese text — CapCut returns err_code=40402002 TTSInvalidText.
+  * The previous code mapped every SleizDev voice alias (vi_vn_1, vi_vn_2,
+    etc.) to a Vietnamese voice REGARDLESS of the text's script.
+  * Worse: the retry loop retried this PERMANENT error 10 times × 30s
+    backoff = 5 minutes per failing slot, for zero benefit (same request
+    → same error forever).
+- Discovered CapCut has 16 CHINESE voices in Voice.json. Tested all 15
+  unique ones with the exact failing text — ALL 15 succeeded. Picked the
+  best for each gender/category:
+    Chinese female sweet      -> zh_female_xiaoyue     (Xiaoyue)
+    Chinese female energetic  -> zh_female_naying      (Naying)
+    Chinese male deep         -> DiT_zh_male_xionger   (XiaoChao)
+    Chinese male dramatic     -> DiT_zh_male_paoxiaoge (paoxiaoge)
+- Fix #1 — Language-aware voice resolution:
+    mini-services/translation-service/scripts/capcut_tts.py
+    * Added detect_script(text) — samples up to 1000 chars and counts
+      CJK vs Latin code points. Returns "cjk", "latin", or "unknown".
+      Covers: CJK Unified (4E00-9FFF), CJK Ext A (3400-4DBF), CJK
+      Compatibility (F900-FAFF), Hiragana (3040-309F), Katakana
+      (30A0-30FF), Hangul (AC00-D7AF).
+    * Added infer_voice_gender(voice_type) — maps a CapCut voice_type
+      to "female"/"female_news"/"male"/"male_dramatic" so we can pick
+      a same-gender substitute when switching language family.
+    * Rewrote resolve_voice(voice_input, text=None) — now takes the text
+      as a second arg. If the text's script doesn't match the requested
+      voice's language family, swaps to a same-gender voice from the
+      correct family. Examples:
+        resolve_voice("vi_vn_1", "Xin chào")      -> BV421_vivn_streaming (no switch)
+        resolve_voice("vi_vn_1", "而且他也掌握着")  -> zh_female_xiaoyue     (CJK -> ZH voice)
+        resolve_voice("vi_vn_2", "而且他也掌握着")  -> DiT_zh_male_xionger   (CJK -> ZH male)
+        resolve_voice("zh_vn_1", "Xin chào")      -> BV421_vivn_streaming (Latin -> VN voice)
+    * Added VIETNAMESE_VOICES and CHINESE_VOICES dicts mapping gender
+      -> voice_type for each language family.
+    * Added 4 new Chinese voice aliases to VOICE_MAP:
+        zh_vn_1 / zh_female / zh_female_sweet -> zh_female_xiaoyue
+        zh_vn_2 / zh_male                     -> DiT_zh_male_xionger
+        zh_female_news                        -> zh_female_naying
+        zh_male_dramatic                      -> DiT_zh_male_paoxiaoge
+    * Updated _process_one_entry() to call resolve_voice(voice_input,
+      text=text) — passes the text so script detection runs.
+    * Updated main() single-text mode to also pass text.
+    * Logs language switches: "[lang] text is CJK, switching voice
+      BV421_vivn_streaming -> zh_female_xiaoyue (gender=female) to
+      avoid TTSInvalidText".
+- Fix #2 — Skip retries for permanent errors:
+    mini-services/translation-service/scripts/capcut_tts.py
+    * Added PERMANENT_ERROR_CODES = {40402001, 40402002, 40402003,
+      40402004, 40402005, 40402010} — these are CapCut's permanent
+      TTS errors (voice not found, invalid text, resource unavailable,
+      text too long, unsupported language, invalid SSML).
+    * Added PERMANENT_ERROR_MESSAGES set for matching by err_msg string.
+    * Added PermanentTtsError exception class — carries err_code,
+      err_msg, voice, text_len, text_preview for clear logging.
+    * Added _classify_task_failure(query_tasks, voice, text) helper —
+      inspects a failed CapCut task response and returns either a
+      PermanentTtsError (skip retries) or a generic RuntimeError
+      (transient, retry).
+    * Updated generate_speech() to use _classify_task_failure() when
+      status="failed" — replaces the old `raise RuntimeError(f"TTS
+      task failed: {err}")` which didn't distinguish permanent vs
+      transient.
+    * Updated _process_one_entry() retry loop — catches
+      PermanentTtsError specifically and returns immediately with a
+      clear "permanent failure" message, skipping all remaining
+      retries. The generic `except Exception` branch still handles
+      transient errors with exponential backoff.
+    * Logs permanent failures with [permanent] tag: "slot N attempt
+      X/Y PERMANENT failure (err_code=40402002 TTSInvalidText),
+      skipping retries".
+- Fix #3 — Same permanent-error handling in TypeScript wrapper:
+    mini-services/translation-service/src/tiktok-tts.ts
+    * generateEntryAudio() retry loop now inspects error messages for
+      permanent-error markers (err_code=40402001-40402010,
+      "permanent failure", "ttsinvalidtext", "ttsvoicenotfound",
+      "ttstextoolong"). When detected, returns false immediately
+      instead of retrying.
+    * This is defense-in-depth — the Python bridge already skips
+      retries, but the TS Phase 2 sequential retry loop also needs to
+      know not to retry a permanent error.
+- Verified end-to-end with test scripts/test_invalid_text_fix.py (23
+  assertions, all passing):
+    Test 1 — detect_script():
+      - Chinese text -> "cjk"               OK
+      - Vietnamese text -> "latin"          OK
+      - English text -> "latin"             OK
+      - Japanese text -> "cjk"              OK
+      - Korean text -> "cjk"                OK
+      - Numbers only -> "unknown"           OK
+      - Empty -> "unknown"                  OK
+      - Mixed CJK majority -> "cjk"         OK
+      - Mixed Latin majority -> "latin"     OK
+    Test 2 — resolve_voice() auto-switching:
+      - vi_vn_1 + CJK text -> zh_female_xiaoyue (auto-switched)  OK
+      - vi_vn_2 + CJK text -> DiT_zh_male_xionger (auto-switched) OK
+      - zh_vn_1 + Latin text -> BV421_vivn_streaming (auto-switched) OK
+      - vi_vn_1 + Latin text -> BV421 (no switch needed)         OK
+      - zh_vn_1 + CJK text -> zh_female_xiaoyue (no switch)      OK
+      - vi_vn_1 + no text -> BV421 (legacy behavior)             OK
+    Test 3 — bridge synthesizes previously-failing text:
+      - Input: --text "而且他也掌握着双奥运出行" --voice vi_vn_1
+      - Bridge auto-switched BV421 -> zh_female_xiaoyue
+      - Output: 41133 byte MP3 in 1.7s (was 5+ min before fix)
+      - Exit code 0
+    Test 4 — permanent error skips retries:
+      - Input: --voice BV_TOTALLY_NONEXISTENT_VOICE_xyz123 (invalid)
+      - CapCut returned err_code=40402004 (permanent)
+      - Bridge exited in 2.5s with code 1 (was 5+ min before fix)
+      - stderr mentions "permanent" / "err_code"
+      - No false-positive output file created
+- All 29 existing tests still pass (17 batch + 12 single):
+    - test_batch_tts.ts:    17 passed
+    - test_capcut_tts.ts:   12 passed
+    - No regression in voice quality for Vietnamese text (Vietnamese
+      voices are still used for Vietnamese text via detect_script()).
+
+Stage Summary:
+- TTSInvalidText (err_code=40402002) is FIXED. The bridge now detects
+  the text's script and auto-switches to a same-gender voice from the
+  correct language family. Vietnamese voices handle Vietnamese text,
+  Chinese voices handle Chinese text.
+- Permanent errors (TTSInvalidText, TTSVoiceNotFound, TTSTextTooLong,
+  etc.) NO LONGER RETRY. The bridge returns immediately with a clear
+  "permanent failure" message instead of wasting 10 × 30s = 5min of
+  backoff on a request that will never succeed.
+- 4 new Chinese voice aliases added to the VOICE_MAP so users can
+  explicitly request Chinese voices if they want.
+- All 23 new test assertions + 29 existing test assertions pass.

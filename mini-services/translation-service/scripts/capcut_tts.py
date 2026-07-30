@@ -87,32 +87,247 @@ VOICE_MAP: Dict[str, str] = {
     "vi_female_review": "multi_female_richgirl_uranus_bigtts",
     # Vietnamese female (anime / high-pitched) — "Giọng Gái Mới Lớn"
     "vi_female_young": "multi_female_peiqi_uranus_bigtts",
-    # Chinese voices (for original Chinese TTS, if ever needed)
-    "zh_vn_1": "BV701_streaming",
-    "zh_female": "BV701_streaming",
-    "zh_male": "BV702_streaming",
+    # Chinese female (sweet, natural) — "Xiaoyue"  [verified working with CJK text]
+    "zh_vn_1": "zh_female_xiaoyue",
+    "zh_female": "zh_female_xiaoyue",
+    "zh_female_sweet": "zh_female_xiaoyue",
+    # Chinese male (deep) — "XiaoChao"  [verified working with CJK text]
+    "zh_vn_2": "DiT_zh_male_xionger",
+    "zh_male": "DiT_zh_male_xionger",
+    # Chinese female (energetic) — "Naying"  [verified working with CJK text]
+    "zh_female_news": "zh_female_naying",
+    # Chinese male (deep, dramatic) — "paoxiaoge"  [verified working with CJK text]
+    "zh_male_dramatic": "DiT_zh_male_paoxiaoge",
 }
 
 
-def resolve_voice(voice_input: str) -> str:
-    """Map a user-facing voice ID to a CapCut voice_type.
+# -------------------------------------------------------------------------
+# Language-aware voice resolution
+#
+# CapCut voices are language-locked: a Vietnamese voice (BV421_vivn_streaming)
+# CANNOT synthesize Chinese text — CapCut returns err_code=40402002
+# TTSInvalidText. The previous code mapped every SleizDev voice alias to a
+# Vietnamese voice, so any SRT containing Chinese characters (typical for
+# donghua before translation) would fail with TTSInvalidText, then waste
+# 10 retries × 30s backoff = 5 minutes per slot before giving up.
+#
+# Fix: detect the dominant script of the text and pick a voice that can
+# actually synthesize it.
+# -------------------------------------------------------------------------
 
-    If the input is already a CapCut voice_type (contains 'BV' or 'Neural'),
-    pass it through unchanged.
+# CapCut voice_types that can synthesize each script family. Each entry is
+# (voice_type, label). When the user's requested voice alias doesn't match
+# the text's script, we substitute a same-gender voice from the correct
+# family. All voices below were verified working against the live CapCut
+# API on 2026-07-31.
+VIETNAMESE_VOICES = {
+    "female": "BV421_vivn_streaming",          # Nhỏ Ngọt Ngào (sweet)
+    "female_news": "BV074_streaming",           # Cô Gái Hoạt Ngôn (energetic)
+    "male": "multi_male_felipe_uranus_bigtts",  # Giọng Nam Trầm (deep)
+}
+CHINESE_VOICES = {
+    "female": "zh_female_xiaoyue",      # Xiaoyue (sweet, natural)
+    "female_news": "zh_female_naying",  # Naying (energetic)
+    "male": "DiT_zh_male_xionger",      # XiaoChao (deep)
+    "male_dramatic": "DiT_zh_male_paoxiaoge",  # paoxiaoge (dramatic)
+}
+
+
+def detect_script(text: str) -> str:
+    """Detect the dominant script of `text`.
+
+    Returns one of:
+      - "cjk"   — Chinese/Japanese/Korean characters dominate (CJK Unified,
+                  CJK Ext A, CJK Compatibility, Hiragana, Katakana, Hangul).
+      - "latin" — Latin script dominates (anything else with letters).
+      - "unknown" — no script-bearing characters (e.g. pure numbers/punctuation).
+
+    We sample up to 1000 characters for speed; that's plenty to tell which
+    script dominates in a typical SRT entry.
+    """
+    if not text:
+        return "unknown"
+    sample = text[:1000]
+    cjk_count = 0
+    latin_count = 0
+    for ch in sample:
+        cp = ord(ch)
+        # CJK Unified Ideographs (4E00–9FFF) + Ext A (3400–4DBF) +
+        # CJK Compatibility (F900–FAFF) + Hiragana (3040–309F) +
+        # Katakana (30A0–30FF) + Hangul Syllables (AC00–D7AF)
+        if (0x4E00 <= cp <= 0x9FFF or 0x3400 <= cp <= 0x4DBF or
+            0xF900 <= cp <= 0xFAFF or 0x3040 <= cp <= 0x30FF or
+            0xAC00 <= cp <= 0xD7AF):
+            cjk_count += 1
+        elif ch.isalpha():
+            latin_count += 1
+    if cjk_count == 0 and latin_count == 0:
+        return "unknown"
+    return "cjk" if cjk_count > latin_count else "latin"
+
+
+def infer_voice_gender(voice_type: str) -> str:
+    """Infer gender/category from a CapCut voice_type string.
+
+    Returns one of "female", "female_news", "male", "male_dramatic" based on
+    naming conventions. Falls back to "female" if unclear (Vietnamese female
+    sweet is the safest default — it handles most Latin-script text well).
+    """
+    v = voice_type.lower()
+    if "male" in v and "felipe" in v:
+        return "male"  # Vietnamese male
+    if "male" in v and ("paoxiao" in v or "xionger" in v):
+        return "male_dramatic" if "paoxiao" in v else "male"
+    if "BV074" in voice_type:
+        return "female_news"  # Vietnamese energetic female
+    if "naying" in v:
+        return "female_news"  # Chinese energetic female
+    # Default to female for sweet voices (BV421, xiaoyue, etc.)
+    return "female"
+
+
+def resolve_voice(voice_input: str, text: Optional[str] = None) -> str:
+    """Map a user-facing voice ID to a CapCut voice_type, switching language
+    family if the text's script doesn't match the requested voice's language.
+
+    Examples:
+      resolve_voice("vi_vn_1", "Xin chào")        -> "BV421_vivn_streaming"  (VN voice, Latin text)
+      resolve_voice("vi_vn_1", "你好世界")         -> "zh_female_xiaoyue"      (auto-switch to ZH voice)
+      resolve_voice("vi_vn_1", "而且他也掌握着")   -> "zh_female_xiaoyue"      (CJK detected -> ZH voice)
+      resolve_voice("zh_male", "你好")             -> "DiT_zh_male_xionger"    (ZH alias, ZH text — no switch needed)
+
+    If `text` is None or empty, no script detection is performed and the
+    voice is resolved purely from the alias map (original behavior).
     """
     if not voice_input:
-        return "BV421_vivn_streaming"  # default = Vietnamese female sweet
+        # Default to Vietnamese female sweet
+        return "BV421_vivn_streaming"
+
+    # 1. Resolve the alias to a base CapCut voice_type.
     mapped = VOICE_MAP.get(voice_input)
     if mapped:
-        return mapped
-    # Pass through anything that looks like a raw CapCut voice_type.
-    return voice_input
+        base_voice = mapped
+    else:
+        # Pass through anything that looks like a raw CapCut voice_type.
+        base_voice = voice_input
+
+    # 2. If no text provided, return the mapped voice as-is (legacy behavior).
+    if not text or not text.strip():
+        return base_voice
+
+    # 3. Detect script and switch language family if needed.
+    script = detect_script(text)
+    if script == "cjk":
+        # The text is CJK. If the base voice is a Vietnamese voice, switch
+        # to a same-gender Chinese voice. Vietnamese voices cannot synthesize
+        # CJK text (err_code=40402002 TTSInvalidText).
+        if base_voice in {v for v in VIETNAMESE_VOICES.values()}:
+            gender = infer_voice_gender(base_voice)
+            # Map "male_dramatic" -> "male" for Chinese if not available
+            zh_gender = gender if gender in CHINESE_VOICES else "female"
+            new_voice = CHINESE_VOICES.get(zh_gender, CHINESE_VOICES["female"])
+            log(
+                "lang",
+                f"text is CJK, switching voice {base_voice} -> {new_voice} "
+                f"(gender={zh_gender}) to avoid TTSInvalidText",
+            )
+            return new_voice
+    elif script == "latin":
+        # The text is Latin. If the base voice is a Chinese voice, switch
+        # to a same-gender Vietnamese voice (Chinese voices can sometimes
+        # synthesize Vietnamese but quality is poor).
+        if base_voice in {v for v in CHINESE_VOICES.values()}:
+            gender = infer_voice_gender(base_voice)
+            vi_gender = gender if gender in VIETNAMESE_VOICES else "female"
+            new_voice = VIETNAMESE_VOICES.get(vi_gender, VIETNAMESE_VOICES["female"])
+            log(
+                "lang",
+                f"text is Latin, switching voice {base_voice} -> {new_voice} "
+                f"(gender={vi_gender}) for better quality",
+            )
+            return new_voice
+
+    return base_voice
 
 
 def log(stage: str, message: str) -> None:
     """Emit a structured log line to stderr."""
     sys.stderr.write(f"[{stage}] {message}\n")
     sys.stderr.flush()
+
+
+# -------------------------------------------------------------------------
+# Permanent-error detection — these err_codes from CapCut mean the request
+# itself is wrong (invalid text, unsupported voice, etc.). Retrying is
+# pointless because the same request will produce the same error forever.
+# We skip retries for these and report failure immediately.
+#
+# Known permanent err_codes (from CapCut sami_text_to_speech API):
+#   40402001 — TTSVoiceNotFound        (voice_type doesn't exist)
+#   40402002 — TTSInvalidText          (text can't be synthesized by this voice)
+#   40402003 — TTSResourceUnavailable  (voice resource_id is invalid/expired)
+#   40402004 — TTSTextTooLong          (text exceeds 500-char limit)
+#   40402005 — TTSUnsupportedLanguage  (voice can't speak this language)
+#   40402010 — TTSInvalidSSML          (SSML is malformed)
+#
+# Transient err_codes (we DO retry these):
+#   50000001 — InternalServerError     (CapCut server hiccup)
+#   50300001 — ServiceUnavailable      (capacity/brief outage)
+#   42900001 — RateLimited             (too many requests)
+#   (no err_code but status=failed)    (unknown — assume transient, retry)
+# -------------------------------------------------------------------------
+PERMANENT_ERROR_CODES = {40402001, 40402002, 40402003, 40402004, 40402005, 40402010}
+PERMANENT_ERROR_MESSAGES = {
+    "TTSInvalidText",
+    "TTSVoiceNotFound",
+    "TTSResourceUnavailable",
+    "TTSTextTooLong",
+    "TTSUnsupportedLanguage",
+    "TTSInvalidSSML",
+}
+
+
+class PermanentTtsError(Exception):
+    """Raised when CapCut returns a permanent error (e.g. TTSInvalidText).
+
+    The retry loop checks `isinstance(exc, PermanentTtsError)` and skips
+    further retries — retrying a permanent error just wastes 10 × 30s = 5min
+    of backoff for no benefit.
+    """
+
+    def __init__(self, err_code: int, err_msg: str, voice: str, text_len: int, text_preview: str):
+        self.err_code = err_code
+        self.err_msg = err_msg
+        self.voice = voice
+        self.text_len = text_len
+        self.text_preview = text_preview
+        super().__init__(
+            f"CapCut rejected text as invalid (err_code={err_code}): "
+            f"voice={voice} text_len={text_len} text='{text_preview}'"
+        )
+
+
+def _classify_task_failure(query_tasks: list, voice: str, text: str) -> Exception:
+    """Build the right exception for a failed CapCut task.
+
+    If the failure has a known permanent err_code/err_msg, return a
+    PermanentTtsError so the retry loop knows to skip retries. Otherwise
+    return a generic RuntimeError (transient — worth retrying).
+    """
+    task = query_tasks[0] if query_tasks else {}
+    err_code = task.get("err_code") or 0
+    err_msg = task.get("err_msg") or task.get("error") or "TTS task failed"
+    text_preview = (text or "")[:60].replace("\n", " ")
+    if err_code in PERMANENT_ERROR_CODES or err_msg in PERMANENT_ERROR_MESSAGES:
+        return PermanentTtsError(
+            err_code=err_code,
+            err_msg=err_msg,
+            voice=voice,
+            text_len=len(text or ""),
+            text_preview=text_preview,
+        )
+    # Transient — include err_code/err_msg in the message for debugging.
+    return RuntimeError(f"TTS task failed: err_code={err_code} err_msg={err_msg}")
 
 
 def extract_speech_url(query_response: Dict[str, Any]) -> Optional[str]:
@@ -280,7 +495,13 @@ def generate_speech(
                     f"FAILED voice={voice} text_len={len(text)} | "
                     f"err={err} | response={response_preview}",
                 )
-                raise RuntimeError(f"TTS task failed: {err}")
+                # Build a typed exception so the retry loop can decide
+                # whether to retry (transient) or skip (permanent). The
+                # _classify_task_failure helper inspects err_code/err_msg
+                # and returns PermanentTtsError for known-permanent codes
+                # (TTSInvalidText=40402002, TTSVoiceNotFound=40402001, etc.)
+                # so we skip retries on requests that will never succeed.
+                raise _classify_task_failure(query_tasks, voice, text)
         time.sleep(1.5)
 
     raise TimeoutError(
@@ -326,7 +547,10 @@ def _process_one_entry(
         # Empty text is not an error — caller should fill this slot with silence.
         return idx, False, "empty text"
 
-    voice_type = resolve_voice(voice_input)
+    # Resolve voice WITH script detection so a Vietnamese voice is swapped
+    # for a Chinese voice if the text is CJK. This avoids err_code=40402002
+    # TTSInvalidText (Vietnamese voices can't synthesize Chinese characters).
+    voice_type = resolve_voice(voice_input, text=text)
     max_attempts = max(1, max_retries + 1)  # 1 initial + N retries
     last_error = "unknown"
 
@@ -355,7 +579,21 @@ def _process_one_entry(
                 if attempt > 1:
                     msg += f" (retry {attempt - 1}/{max_retries})"
                 return idx, True, msg
-        except Exception as exc:  # noqa: BLE001 — retry, don't abort
+        except PermanentTtsError as exc:
+            # PERMANENT error (e.g. TTSInvalidText, TTSVoiceNotFound).
+            # Retrying is pointless — the same request will produce the
+            # same error forever. Skip remaining retries and report failure
+            # immediately so we don't waste 10 × 30s = 5min of backoff.
+            log(
+                "permanent",
+                f"slot {idx} attempt {attempt}/{max_attempts} PERMANENT failure "
+                f"(err_code={exc.err_code} {exc.err_msg}), skipping retries",
+            )
+            return idx, False, (
+                f"permanent failure (err_code={exc.err_code} {exc.err_msg}): "
+                f"voice={exc.voice} text_len={exc.text_len} text='{exc.text_preview}'"
+            )
+        except Exception as exc:  # noqa: BLE001 — transient, retry
             last_error = f"{type(exc).__name__}: {exc}"
 
         if attempt < max_attempts:
@@ -546,7 +784,7 @@ def main() -> int:
         log("error", "Either --batch <manifest> OR both --text + --output are required")
         return 2
 
-    voice_type = resolve_voice(args.voice)
+    voice_type = resolve_voice(args.voice, text=args.text)
 
     try:
         generate_speech(

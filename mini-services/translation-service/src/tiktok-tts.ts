@@ -109,6 +109,29 @@ async function generateEntryAudio(
       lastError = 'output missing or too small';
     } catch (err: any) {
       lastError = err.message;
+      // PERMANENT errors (e.g. TTSInvalidText err_code=40402002) skip retries.
+      // The Python bridge surfaces these as PermanentTtsError — check the
+      // message for the marker substring. Retrying a permanent error wastes
+      // 10 × 30s = 5min of backoff for zero benefit.
+      const msg = (err.message || '').toLowerCase();
+      const isPermanent =
+        msg.includes('permanent failure') ||
+        msg.includes('err_code=40402001') ||
+        msg.includes('err_code=40402002') ||
+        msg.includes('err_code=40402003') ||
+        msg.includes('err_code=40402004') ||
+        msg.includes('err_code=40402005') ||
+        msg.includes('err_code=40402010') ||
+        msg.includes('ttsinvalidtext') ||
+        msg.includes('ttsvoicenotfound') ||
+        msg.includes('ttstextoolong');
+      if (isPermanent) {
+        console.error(
+          `[tts]   ✗ PERMANENT failure on attempt ${attempt}/${maxAttempts} ` +
+            `(${lastError}) — skipping retries`
+        );
+        return false;
+      }
     }
 
     if (attempt < maxAttempts) {
