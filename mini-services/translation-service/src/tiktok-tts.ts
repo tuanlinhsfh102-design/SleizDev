@@ -38,170 +38,41 @@ const FFMPEG_PATH = ffmpegStatic as unknown as string;
 // capcut-tts.ts). Larger SRTs are split into multiple batches of this size.
 const TTS_BATCH_SIZE = parseInt(process.env.CAPCUT_TTS_BATCH_SIZE || '50', 10);
 
-// TikTok TTS API endpoint (v6 + /invoke is the current working endpoint)
-const TIKTOK_TTS_URL = 'https://api16-normal-v6.tiktokv.com/media/api/text/speech/invoke';
+// Max retry attempts for a single TTS entry before giving up and filling
+// the slot with silence. Override via CAPCUT_TTS_MAX_RETRIES env var.
+// Set to 1 to disable retries (try once, then silence on failure).
+const TTS_MAX_RETRIES = parseInt(process.env.CAPCUT_TTS_MAX_RETRIES || '10', 10);
 
-// Real TikTok session ID (required for the API to work)
-// Get it from browser cookies after logging in to TikTok: Settings > Application > Cookies > sessionid
-const TIKTOK_SESSION_ID = process.env.TIKTOK_SESSION_ID || '';
+// Base delay between retries (exponential backoff with jitter).
+// Retry 1 waits ~2s, retry 2 ~4s, retry 3 ~8s, etc.
+const RETRY_BASE_DELAY_MS = 2000;
 
-// Vietnamese voice options
-const VOICE_MAP: Record<string, string> = {
-  vi_vn_1: 'vi_vn_1',         // Female
-  vi_vn_2: 'vi_vn_2',         // Male
-  vi_male: 'vi_vn_2',         // Male alias
-  vi_female: 'vi_vn_1',       // Female alias
-  vi_female_sweet: 'vi_vn_1', // Female sweet (use vi_vn_1)
-};
-
-interface TiktokTtsResult {
-  success: boolean;
-  audioBuffer?: Buffer;
-  error?: string;
-}
-
-/**
- * Prepare text for TikTok TTS API (spaces → '+', remove special chars)
- */
-function prepareTiktokText(text: string): string {
-  return text
-    .replace(/\+/g, 'plus')
-    .replace(/&/g, 'and')
-    .replace(/\s+/g, '+');
-}
+// -------------------------------------------------------------------------
+// Single-provider retry-based TTS (CapCut only, no fallbacks)
+// -------------------------------------------------------------------------
+//
+// HISTORY:
+//   This module used to support 3 providers:
+//     1. CapCut TTS (preferred — 24 native Vietnamese voices)
+//     2. TikTok TTS (required TIKTOK_SESSION_ID env var, almost never set)
+//     3. Google Translate TTS (last-resort — robotic, heavily rate-limited)
+//
+//   Per user request (Task ID 10), TikTok and Google Translate fallbacks
+//   have been REMOVED. The pipeline now uses CapCut TTS exclusively, with
+//   up to TTS_MAX_RETRIES retry attempts on failure (default 10). This
+//   ensures consistent voice quality across all clips and avoids the
+//   rate-limiting issues with Google Translate TTS.
+//
+//   CapCut transient failures (network blip, CDN hiccup, brief API rate
+//   limit) almost always succeed on retry 1-3. After TTS_MAX_RETRIES+1
+//   total attempts fail, the slot is filled with silence to keep the
+//   timeline aligned.
 
 /**
- * Call TikTok TTS API to generate speech from text.
- * Requires TIKTOK_SESSION_ID env var with a real TikTok session cookie.
- */
-async function callTiktokTts(text: string, voice: string): Promise<TiktokTtsResult> {
-  if (!text || text.trim().length === 0) {
-    return { success: false, error: 'Empty text' };
-  }
-
-  if (!TIKTOK_SESSION_ID) {
-    return { success: false, error: 'TIKTOK_SESSION_ID not set in env' };
-  }
-
-  // TikTok API has a ~300 char limit per request
-  if (text.length > 300) {
-    return { success: false, error: 'Text too long (max 300 chars)' };
-  }
-
-  const tiktokVoice = VOICE_MAP[voice] || 'vi_vn_1';
-  const preparedText = prepareTiktokText(text);
-
-  const params = new URLSearchParams({
-    req_text: preparedText,
-    speaker_map_type: '0',
-    aid: '1233',
-    text_speaker: tiktokVoice,
-    with_frontend: '1',
-    frontend_silent_character_ratio: '0.06',
-  });
-
-  const url = `${TIKTOK_TTS_URL}?${params.toString()}`;
-
-  const headers: Record<string, string> = {
-    'User-Agent': 'com.zhiliaoapp.musically/2022500030 (Linux; U; Android 7.1.2; en_US; SM-G977N; Build/N2G47H;tt-ok/3.12.13.1)',
-    'Cookie': `sessionid=${TIKTOK_SESSION_ID}`,
-    'Content-Type': 'application/json',
-  };
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({}),
-    });
-
-    if (!response.ok) {
-      return { success: false, error: `HTTP ${response.status}` };
-    }
-
-    const data = await response.json() as any;
-
-    if (data.status_code === 0 && data.data?.v_str) {
-      // v_str is base64-encoded MP3
-      const audioBuffer = Buffer.from(data.data.v_str, 'base64');
-      return { success: true, audioBuffer };
-    }
-
-    return {
-      success: false,
-      error: data.status_msg || `Status: ${data.status_code}`,
-    };
-  } catch (error: any) {
-    return { success: false, error: error.message };
-  }
-}
-
-/**
- * Fallback TTS using Google Translate TTS (no API key needed)
- */
-async function googleTranslateTts(text: string, lang = 'vi'): Promise<TiktokTtsResult> {
-  try {
-    // Chunk text if too long (Google TTS has a ~200 char limit per request)
-    const chunks: string[] = [];
-    let current = '';
-    const sentences = text.split(/(?<=[.!?。！？\n])/);
-    for (const sentence of sentences) {
-      if ((current + sentence).length > 180) {
-        if (current) chunks.push(current.trim());
-        current = sentence;
-      } else {
-        current += sentence;
-      }
-    }
-    if (current.trim()) chunks.push(current.trim());
-    if (chunks.length === 0) chunks.push(text);
-
-    const buffers: Buffer[] = [];
-    for (const chunk of chunks) {
-      if (!chunk) continue;
-      // Use gtts-style URL which is more reliable than the tw-ob client
-      const url = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(chunk)}&tl=${lang}&total=1&idx=0&textlen=${chunk.length}&client=gtx&prev=input&ttsspeed=1`;
-      try {
-        const response = await fetch(url, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': 'https://translate.google.com/',
-            'Accept': 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
-          },
-        });
-        if (response.ok) {
-          const buffer = Buffer.from(await response.arrayBuffer());
-          if (buffer.length > 100) buffers.push(buffer); // skip empty/error responses
-        }
-      } catch (_) { /* skip failed chunks */ }
-      // Delay to avoid rate limiting
-      await new Promise((r) => setTimeout(r, 150));
-    }
-
-    if (buffers.length === 0) {
-      return { success: false, error: 'No audio generated from Google TTS' };
-    }
-
-    return { success: true, audioBuffer: Buffer.concat(buffers) };
-  } catch (error: any) {
-    return { success: false, error: error.message };
-  }
-}
-
-/**
- * Generate TTS audio for a single SRT entry.
+ * Generate TTS audio for a single SRT entry using ONLY CapCut TTS, with
+ * up to TTS_MAX_RETRIES retry attempts on failure.
  *
- * Provider order (best to worst):
- *   1. CapCut TTS  — 24 native Vietnamese voices, same engine as CapCut app.
- *                    This is now the DEFAULT because the previous TikTok-first
- *                    pipeline failed silently (TIKTOK_SESSION_ID env var was
- *                    never set) and fell back to Google Translate TTS (robotic,
- *                    heavily rate-limited). CapCut TTS also previously timed out
- *                    due to a status-string mismatch bug in the vendored SDK
- *                    (it polled for "success" but the API returns "succeed");
- *                    that bug is now fixed in vendor/capcut_tts_api/client.py.
- *   2. TikTok TTS  — only used if TIKTOK_SESSION_ID is set and CapCut fails.
- *   3. Google Translate TTS — last-resort fallback (rate-limited, robotic).
+ * @returns true on success, false after TTS_MAX_RETRIES+1 total attempts fail.
  */
 async function generateEntryAudio(
   text: string,
@@ -212,35 +83,47 @@ async function generateEntryAudio(
   const cleanText = text.replace(/\n/g, ' ').replace(/\[.*?\]/g, '').trim();
   if (!cleanText) return false;
 
-  // 1. CapCut TTS (preferred — native Vietnamese voices, no API key needed)
-  try {
-    const ok = await capcutGenerateSpeech(cleanText, voice, outputPath, {
-      timeoutSeconds: 90,
-    });
-    if (ok && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100) {
-      return true;
+  // Remove any stale output from a previous (failed) attempt so the
+  // size-check below doesn't pass on a half-written file.
+  try { fs.unlinkSync(outputPath); } catch { /* ignore */ }
+
+  const maxAttempts = Math.max(1, TTS_MAX_RETRIES + 1); // 1 initial + N retries
+  let lastError = 'unknown';
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const ok = await capcutGenerateSpeech(cleanText, voice, outputPath, {
+        timeoutSeconds: 90,
+      });
+      if (ok && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 100) {
+        if (attempt > 1) {
+          console.log(`[tts]   ✓ succeeded on retry ${attempt - 1}/${TTS_MAX_RETRIES}`);
+        }
+        return true;
+      }
+      lastError = 'output missing or too small';
+    } catch (err: any) {
+      lastError = err.message;
     }
-    console.warn('[tts] CapCut TTS did not produce a valid file, falling back');
-  } catch (err: any) {
-    console.warn(`[tts] CapCut TTS threw: ${err.message}`);
+
+    if (attempt < maxAttempts) {
+      // Exponential backoff with jitter: 2s, 4s, 8s, 16s, ... ± 20% jitter.
+      // Capped at 30s so we don't wait forever on a slot.
+      const baseDelay = Math.min(30000, RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 1));
+      const jitter = baseDelay * (0.8 + Math.random() * 0.4);
+      console.warn(
+        `[tts]   attempt ${attempt}/${maxAttempts} failed (${lastError}), ` +
+          `retrying in ${(jitter / 1000).toFixed(1)}s...`
+      );
+      await new Promise((r) => setTimeout(r, jitter));
+    } else {
+      console.error(
+        `[tts]   ✗ all ${maxAttempts} attempts failed for this slot (${lastError})`
+      );
+    }
   }
 
-  // 2. TikTok TTS (only works if TIKTOK_SESSION_ID is set)
-  let result = await callTiktokTts(cleanText, voice);
-
-  // 3. Google Translate TTS (last-resort fallback)
-  if (!result.success) {
-    console.warn(`[tts] TikTok failed, using Google TTS: ${result.error}`);
-    result = await googleTranslateTts(cleanText, 'vi');
-  }
-
-  if (!result.success || !result.audioBuffer) {
-    console.error(`[tts] All TTS methods failed: ${result.error}`);
-    return false;
-  }
-
-  fs.writeFileSync(outputPath, result.audioBuffer);
-  return true;
+  return false;
 }
 
 /**
@@ -251,10 +134,11 @@ async function generateEntryAudio(
  *     batches of TTS_BATCH_SIZE (default 50). The bridge runs them in
  *     parallel via ThreadPoolExecutor. This is ~50x faster than the old
  *     sequential 1-clip-at-a-time loop.
- *   Phase 2 (sequential retry): For any entries that failed in phase 1
- *     (network blip, transient CapCut error, etc.), retry them one-by-one
- *     through generateEntryAudio() which falls back to TikTok TTS and then
- *     Google Translate TTS. If all retries fail, fill the slot with silence.
+ *   Phase 2 (sequential retry, max 10 attempts per slot): For any entries
+ *     that failed in phase 1 (network blip, transient CapCut error, etc.),
+ *     retry them one-by-one via generateEntryAudio() — same CapCut provider,
+ *     with exponential backoff. After TTS_MAX_RETRIES+1 total attempts
+ *     fail, fill the slot with silence so the timeline stays aligned.
  *
  * Then merges all clips with ffmpeg using:
  *   - adelay=N|N   to position each clip at its start_ms
@@ -338,6 +222,7 @@ export async function generateAudioFromSrt(
     const batchStartMs = Date.now();
     const results = await capcutGenerateSpeechBatch(batchEntries, {
       timeoutSeconds: 90,
+      maxRetries: TTS_MAX_RETRIES,
     });
     const batchDuration = ((Date.now() - batchStartMs) / 1000).toFixed(1);
 
@@ -368,15 +253,14 @@ export async function generateAudioFromSrt(
   }
 
   // -----------------------------------------------------------------------
-  // PHASE 2: Sequential retry for failed slots.
-  // For each failed slot, try the full fallback chain (CapCut single →
-  // TikTok → Google Translate TTS). If everything fails, fill with silence
-  // so the timing math still works.
+  // PHASE 2: Sequential retry for failed slots (max TTS_MAX_RETRIES per slot).
+  // For each failed slot, retry the SAME CapCut provider with exponential
+  // backoff. Only after all retries are exhausted do we fill with silence.
   // -----------------------------------------------------------------------
   if (failedSlots.size > 0) {
     console.log(
       `[tts] Phase 2: retrying ${failedSlots.size} failed slot(s) sequentially ` +
-        `(CapCut single → TikTok → Google TTS → silence)...`
+        `(CapCut TTS only, max ${TTS_MAX_RETRIES} retries per slot → silence)...`
     );
     const failedList = Array.from(failedSlots).sort((a, b) => a - b);
     for (let retryIdx = 0; retryIdx < failedList.length; retryIdx++) {
@@ -389,9 +273,9 @@ export async function generateAudioFromSrt(
         // Final fallback: silence. Keeps the timeline aligned.
         const slotMs = Math.max(100, entry.endMs - entry.startMs);
         await createSilentClip(clipPaths[i], slotMs);
-        console.warn(`[tts]   slot ${i} -> silence (all TTS providers failed)`);
+        console.warn(`[tts]   slot ${i} -> silence (all retries exhausted)`);
       } else {
-        console.log(`[tts]   slot ${i} -> recovered via fallback chain`);
+        console.log(`[tts]   slot ${i} -> recovered via retry`);
       }
     }
   }

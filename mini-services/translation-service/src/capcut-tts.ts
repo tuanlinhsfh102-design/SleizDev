@@ -54,6 +54,14 @@ const DEFAULT_BATCH_CONCURRENCY = parseInt(
   10
 );
 
+// Default max retry attempts per entry on failure. Override via env var.
+// Set to 0 for no retries. Retries use exponential backoff (2s, 4s, 8s, ...
+// capped at 30s, ±20% jitter).
+const DEFAULT_MAX_RETRIES = parseInt(
+  process.env.CAPCUT_TTS_MAX_RETRIES || '10',
+  10
+);
+
 export interface CapCutTtsOptions {
   /** Optional CapCut device.json profile path. */
   devicePath?: string;
@@ -92,6 +100,15 @@ export interface CapCutTtsBatchOptions {
   timeoutSeconds?: number;
   /** Number of parallel TTS workers. Default 50 (override via CAPCUT_TTS_CONCURRENCY env). */
   concurrency?: number;
+  /**
+   * Max retry attempts per entry on failure. Default 10 (override via
+   * CAPCUT_TTS_MAX_RETRIES env). Set to 0 for no retries.
+   *
+   * Retries use exponential backoff (2s, 4s, 8s, ... capped at 30s, ±20%
+   * jitter). CapCut transient failures (network blip, CDN hiccup, brief
+   * API rate limit) almost always succeed on retry 1-3.
+   */
+  maxRetries?: number;
 }
 
 /**
@@ -290,6 +307,7 @@ export async function generateSpeechBatch(
   }
 
   const concurrency = Math.max(1, options.concurrency ?? DEFAULT_BATCH_CONCURRENCY);
+  const maxRetries = Math.max(0, options.maxRetries ?? DEFAULT_MAX_RETRIES);
   const timeoutSeconds = options.timeoutSeconds ?? 90;
   const devicePath =
     options.devicePath || (fs.existsSync(DEVICE_JSON) ? DEVICE_JSON : undefined);
@@ -307,23 +325,29 @@ export async function generateSpeechBatch(
     fs.writeFileSync(manifestPath, JSON.stringify(entries), 'utf-8');
     console.log(
       `[capcut-tts] Batch: ${entries.length} entries, concurrency=${concurrency}, ` +
-        `manifest=${path.basename(manifestPath)}`
+        `max_retries=${maxRetries}, manifest=${path.basename(manifestPath)}`
     );
 
     const args: string[] = [
       BRIDGE_SCRIPT,
       '--batch', manifestPath,
       '--concurrency', String(concurrency),
+      '--max-retries', String(maxRetries),
       '--timeout', String(timeoutSeconds),
     ];
     if (devicePath) {
       args.push('--device', devicePath);
     }
 
-    // Bridge timeout = per-task timeout + generous buffer for the slowest
-    // parallel task. With 50 workers and 90s per task, the worst case is
-    // ~2 batches deep = 180s. We give 5x the per-task timeout to be safe.
-    const bridgeTimeout = timeoutSeconds * 5;
+    // Bridge timeout = per-task timeout + retry buffer for the slowest
+    // parallel task. With 50 workers, 90s per task, and 10 retries (worst
+    // case ~30s each = 300s of retry backoff), the worst case is
+    // (90 + 300) * ceil(N/50) seconds. We add a generous buffer.
+    const retryBufferMs = maxRetries * 30 * 1000; // 30s per retry, worst case
+    const bridgeTimeout = Math.max(
+      timeoutSeconds * 5,
+      (timeoutSeconds * 1000 + retryBufferMs) / 1000 + 60
+    );
     const exitCode = await runPythonBridge(args, bridgeTimeout);
     console.log(`[capcut-tts] Batch bridge exited with code ${exitCode}`);
 

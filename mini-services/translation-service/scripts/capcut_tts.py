@@ -263,6 +263,7 @@ def _process_one_entry(
     entry: Dict[str, Any],
     device_path: Optional[str],
     timeout_seconds: float,
+    max_retries: int = 10,
 ) -> Tuple[int, bool, str]:
     """Process a single batch entry. Returns (idx, success, message).
 
@@ -271,7 +272,15 @@ def _process_one_entry(
       - text:   text to synthesize
       - voice:  (optional, defaults to vi_vn_1) voice ID or CapCut voice_type
       - rate:   (optional, defaults to 1.0) speech rate
+
+    Retries up to `max_retries` times on failure with exponential backoff
+    (2s, 4s, 8s, ... ± 20% jitter, capped at 30s). CapCut transient failures
+    (network blip, CDN hiccup, brief rate limit) almost always succeed on
+    retry 1-3. Only after max_retries+1 total attempts fail do we report
+    failure — the TS caller will then fill the slot with silence.
     """
+    import random  # local import to avoid polluting module top-level
+
     output_path = entry.get("output") or ""
     text = entry.get("text") or ""
     voice_input = entry.get("voice") or "vi_vn_1"
@@ -284,21 +293,57 @@ def _process_one_entry(
         return idx, False, "empty text"
 
     voice_type = resolve_voice(voice_input)
-    try:
-        generate_speech(
-            text=text,
-            voice=voice_type,
-            rate=str(rate),
-            output_path=output_path,
-            device_path=device_path,
-            timeout_seconds=timeout_seconds,
-        )
-        if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
-            return idx, False, f"output empty: {output_path}"
-        size_kb = Path(output_path).stat().st_size / 1024
-        return idx, True, f"{size_kb:.1f}KB -> {Path(output_path).name}"
-    except Exception as exc:  # noqa: BLE001 — batch should not abort on one failure
-        return idx, False, f"{type(exc).__name__}: {exc}"
+    max_attempts = max(1, max_retries + 1)  # 1 initial + N retries
+    last_error = "unknown"
+
+    for attempt in range(1, max_attempts + 1):
+        # Remove any stale output from a previous attempt so the size-check
+        # below doesn't pass on a half-written file.
+        try:
+            Path(output_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        try:
+            generate_speech(
+                text=text,
+                voice=voice_type,
+                rate=str(rate),
+                output_path=output_path,
+                device_path=device_path,
+                timeout_seconds=timeout_seconds,
+            )
+            if not Path(output_path).is_file() or Path(output_path).stat().st_size == 0:
+                last_error = f"output empty: {output_path}"
+            else:
+                size_kb = Path(output_path).stat().st_size / 1024
+                msg = f"{size_kb:.1f}KB -> {Path(output_path).name}"
+                if attempt > 1:
+                    msg += f" (retry {attempt - 1}/{max_retries})"
+                return idx, True, msg
+        except Exception as exc:  # noqa: BLE001 — retry, don't abort
+            last_error = f"{type(exc).__name__}: {exc}"
+
+        if attempt < max_attempts:
+            # Exponential backoff with jitter: 2s, 4s, 8s, 16s, ... ± 20% jitter.
+            # Capped at 30s. Using time.sleep inside the worker is fine because
+            # ThreadPoolExecutor runs each worker in its own thread — the other
+            # 49 workers continue making progress while this one sleeps.
+            base_delay = min(30.0, 2.0 * (2 ** (attempt - 1)))
+            jitter = base_delay * (0.8 + random.random() * 0.4)
+            log(
+                "retry",
+                f"slot {idx} attempt {attempt}/{max_attempts} failed "
+                f"({last_error}), retrying in {jitter:.1f}s...",
+            )
+            time.sleep(jitter)
+        else:
+            log(
+                "retry",
+                f"slot {idx} all {max_attempts} attempts failed ({last_error})",
+            )
+
+    return idx, False, f"all {max_attempts} attempts failed: {last_error}"
 
 
 def run_batch(
@@ -306,6 +351,7 @@ def run_batch(
     concurrency: int,
     device_path: Optional[str],
     timeout_seconds: float,
+    max_retries: int = 10,
 ) -> int:
     """Run TTS for every entry in the manifest in parallel.
 
@@ -323,8 +369,9 @@ def run_batch(
           ...
         ]
 
-    Exit code: 0 if ALL entries succeeded, 1 if any failed (caller can read
-    the result manifest to retry failures sequentially).
+    Each entry is retried up to `max_retries` times on failure with
+    exponential backoff (handled inside _process_one_entry). Exit code:
+    0 if ALL entries succeeded, 1 if any failed.
     """
     if not Path(manifest_path).is_file():
         log("error", f"Manifest file not found: {manifest_path}")
@@ -342,7 +389,11 @@ def run_batch(
         return 2
 
     total = len(entries)
-    log("batch", f"{total} entries, concurrency={concurrency}, timeout={timeout_seconds}s")
+    log(
+        "batch",
+        f"{total} entries, concurrency={concurrency}, "
+        f"timeout={timeout_seconds}s, max_retries={max_retries}",
+    )
 
     results: List[Dict[str, Any]] = [{} for _ in range(total)]
     start_time = time.time()
@@ -357,7 +408,12 @@ def run_batch(
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
             pool.submit(
-                _process_one_entry, i, entries[i], device_path, timeout_seconds
+                _process_one_entry,
+                i,
+                entries[i],
+                device_path,
+                timeout_seconds,
+                max_retries,
             ): i
             for i in range(total)
         }
@@ -424,6 +480,13 @@ def main() -> int:
         default=50,
         help="Max parallel TTS workers in batch mode (default: 50)",
     )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=10,
+        help="Max retry attempts per entry on failure (default: 10). "
+        "Exponential backoff: 2s, 4s, 8s, ... capped at 30s.",
+    )
     # Shared
     parser.add_argument("--device", default=None, help="Optional path to a device.json profile")
     parser.add_argument(
@@ -441,6 +504,7 @@ def main() -> int:
             concurrency=max(1, args.concurrency),
             device_path=args.device,
             timeout_seconds=args.timeout,
+            max_retries=max(0, args.max_retries),
         )
 
     # Single-text mode (original behavior)
