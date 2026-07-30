@@ -820,30 +820,83 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
                 <div className="space-y-4">
                   <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
                     <CheckCircle2 className="w-5 h-5 text-green-500" />
-                    <div className="flex-1">
+                    <div className="flex-1 min-w-0">
                       <p className="text-sm text-white font-medium">Đã tải lên video</p>
-                      <p className="text-xs text-slate-400">Sẵn sàng để bắt đầu dịch</p>
+                      <p className="text-xs text-slate-400 truncate">
+                        Sẵn sàng để bắt đầu dịch — hoặc đổi video bên dưới
+                      </p>
                     </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => document.getElementById('video-input-replace')?.click()}
-                      className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
-                    >
-                      <RefreshCw className="w-3 h-3 mr-1" />
-                      Đổi video
-                    </Button>
-                    <input
-                      id="video-input-replace"
-                      type="file"
-                      accept="video/*"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) handleVideoUpload(file);
-                      }}
-                    />
                   </div>
+
+                  {/* Replace video: file upload OR TikTok URL */}
+                  <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30 space-y-3">
+                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wider">
+                      Đổi video
+                    </p>
+                    {/* File upload button */}
+                    <div className="flex gap-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => document.getElementById('video-input-replace')?.click()}
+                        className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
+                        disabled={tiktokImporting || videoUploading}
+                      >
+                        <RefreshCw className="w-3 h-3 mr-1" />
+                        Chọn file từ máy
+                      </Button>
+                      <input
+                        id="video-input-replace"
+                        type="file"
+                        accept="video/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (file) handleVideoUpload(file);
+                        }}
+                      />
+                    </div>
+                    {/* TikTok URL import */}
+                    {tiktokImporting ? (
+                      <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
+                        <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm text-white font-medium truncate">
+                            {tiktokImportStage || 'Đang xử lý...'}
+                          </p>
+                          <p className="text-xs text-slate-400 mt-0.5">
+                            Có thể mất 30-120 giây tùy độ dài video
+                          </p>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex gap-2">
+                        <input
+                          type="url"
+                          value={tiktokUrl}
+                          onChange={(e) => setTiktokUrl(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && tiktokUrl.trim()) {
+                              e.preventDefault();
+                              handleTiktokImport();
+                            }
+                          }}
+                          placeholder="Hoặc dán link TikTok để thay thế..."
+                          className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                          disabled={tiktokImporting || videoUploading}
+                        />
+                        <Button
+                          onClick={handleTiktokImport}
+                          disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
+                          className="bg-rose-600 hover:bg-rose-700 text-white"
+                        >
+                          <LinkIcon className="w-4 h-4 mr-1" />
+                          Tải video
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+
                   {!apiKeys.gemini && (
                     <div className="flex items-center gap-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
                       <AlertCircle className="w-5 h-5 text-yellow-500" />

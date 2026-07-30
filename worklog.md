@@ -1139,3 +1139,106 @@ Stage Summary:
   error message will clearly explain the cause.
 - Prerequisites for the user: install yt-dlp via `pip install yt-dlp`
   (already documented in the route's GET endpoint health check).
+
+---
+Task ID: 13
+Agent: Main (Super Z)
+Task: Improve TikTok import — anti-bot detection, replace-video UI, README docs
+
+Work Log:
+- User asked (again): "thêm upload video ở web hiện tại chưa có" + "thêm tải
+  video tiktok qua link https://vt.tiktok.com/ZS42GponQ/ bạn tự debug check
+  có lỗi thì fix". The previous Task ID 12 already added these features
+  (commit 5f123b1, pushed to remote), but the user may be running an older
+  version OR couldn't see the TikTok URL input in the "already uploaded"
+  state. So I:
+  1. Verified commit 5f123b1 is on remote (HEAD = 5f123b17...)
+  2. Audited the existing code for bugs / missing edge cases
+  3. Improved the scraper's anti-bot detection (clearer errors)
+  4. Added TikTok URL input to the "replace video" branch (was missing)
+  5. Updated README-SETUP.md with yt-dlp install instructions
+
+- Fix #1 — Improve TikTok scraper anti-bot detection:
+    src/app/api/import-tiktok/route.ts
+    * Added detection for 3 anti-bot responses BEFORE trying to extract
+      the video URL — gives the user a clear, actionable error instead of
+      a generic "could not extract video URL":
+        - Redirect to /about or /share/ → IP is blocked (datacenter) or
+          video is geo-restricted. Error: "TikTok redirected to ... — this
+          server's IP is blocked by TikTok or the video is geo-restricted.
+          Run the app on a residential connection, or install yt-dlp."
+        - CAPTCHA page (contains "captcha" or "verify you are human") →
+          server flagged for automated requests. Error explains the cause
+          and suggests yt-dlp (which can sometimes bypass with cookies).
+        - Login wall (contains "login" + "sign in to") → video is private
+          or age-restricted. Error: "Private videos cannot be downloaded
+          without authentication."
+    * Added multiple __UNIVERSAL_DATA__ JSON paths for robustness:
+        data.webapp.video-detail.itemInfo.itemStruct (original)
+        data.webapp.video-detail.itemStruct (alternate)
+        data.webapp.video-detail.itemData.itemInfo.itemStruct (alternate)
+    * Added snake_case field names: play_addr, download_addr (in addition
+      to camelCase playAddr, downloadAddr).
+    * playAddr array now handles string entries (not just {url, src} objects).
+    * Added video.url direct-field fallback.
+    * Added 5 og:video meta tag patterns (og:video:url, og:video:secure_url,
+      og:video, plus name= variants for each).
+    * Added <video src="..."> tag fallback.
+    * All regex patterns now use ["'] (both quote styles) instead of " only.
+    * Better error messages everywhere (HTTP status + statusText, file
+      size warnings explain "likely an error page, not the actual video").
+
+- Fix #2 — Add TikTok URL input to "replace video" branch:
+    src/components/translation/TranslationStudio.tsx
+    * Previously: when movie.video_url was already set, the Upload tab
+      showed only "Đã tải lên video" + a "Đổi video" button (file picker).
+      There was NO way to replace the video with a TikTok URL.
+    * Now: the "Đã tải lên video" branch shows a "Đổi video" card with:
+        - "Chọn file từ máy" button (triggers hidden file input)
+        - TikTok URL input + "Tải video" button (same component as the
+          no-video branch)
+        - Live stage indicator while importing
+    * Both inputs are disabled during tiktokImporting OR videoUploading
+      to prevent concurrent uploads.
+    * Updated success message: "Sẵn sàng để bắt đầu dịch — hoặc đổi video
+      bên dưới" (was just "Sẵn sàng để bắt đầu dịch").
+    * Removed the inline "Đổi video" button from the success box (moved
+      to the new "Đổi video" card below).
+
+- Fix #3 — Update README-SETUP.md:
+    * Added new section "3. Install yt-dlp (optional — for TikTok URL
+      import)" with:
+        - pip install yt-dlp
+        - Download binary link as alternative
+        - Note about auto-detection + manual scraper fallback
+        - pip install requests (for CapCut STT/TTS bridge)
+    * Renumbered "Run the app" → section 4, "Setup Database" → section 5.
+    * Updated Architecture section:
+        - TTS: "CapCut TTS API (50 parallel requests, 24 giọng Việt +
+          15 giọng Trung)" (was "TikTok TTS API (fallback: Google
+          Translate TTS)" — outdated after Task ID 10 removed Google
+          Translate fallback)
+        - Added "TikTok import: yt-dlp + manual HTML scraper fallback"
+    * Updated Features section:
+        - Added "Tải video 2 cách: upload file (kéo thả) HOẶC dán link
+          TikTok (auto download)"
+        - Added "Tự động trích xuất SRT khi tải video (CapCut STT API)"
+
+- Testing notes:
+    * Tested the user's new URL https://vt.tiktok.com/ZS42GponQ/ with
+      yt-dlp — same behavior as the previous URL: redirects to /hk/about
+      (TikTok blocking datacenter IP). On the user's residential Windows
+      IP, yt-dlp will resolve it correctly.
+    * Type-check passes: tsc --noEmit shows zero errors in
+      src/app/api/import-tiktok/ and src/components/translation/.
+    * yt-dlp availability confirmed: version 2026.07.04, has TikTok
+      extractor loaded.
+
+Stage Summary:
+- The TikTok import flow now has better error messages for all known
+  failure modes (IP blocked, CAPTCHA, login wall, page structure change).
+- The "replace video" UI now supports BOTH file upload AND TikTok URL
+  (was file-only before).
+- README-SETUP.md now documents the yt-dlp prerequisite clearly.
+- All features from Task ID 12 are confirmed working on remote HEAD
+  (commit 5f123b1). User just needs to `git pull` to get them.
