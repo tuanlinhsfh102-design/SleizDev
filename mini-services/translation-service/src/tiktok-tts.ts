@@ -19,7 +19,8 @@
 
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import os from 'os';
+import { exec, execFile } from 'child_process';
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
 import { SrtEntry, timeToMs } from './srt-utils.js';
@@ -30,7 +31,11 @@ import {
 } from './capcut-tts.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
+
+// Monotonic counter to make per-call temp filenames unique within a process.
+let tempFileSeq = 0;
 
 // Batch size for parallel TTS. 50 means up to 50 CapCut TTS requests run
 // concurrently — empirically the CapCut API handles this without rate-
@@ -368,12 +373,9 @@ async function mergeClipsWithTiming(
     `[tts] Merge: ${clipPaths.length} clips, total duration=${totalDurationSec.toFixed(2)}s`
   );
 
-  const inputArgs: string[] = [];
   const filterParts: string[] = [];
 
   for (let i = 0; i < clipPaths.length; i++) {
-    inputArgs.push(`-i "${clipPaths[i]}"`);
-
     const startMs = Math.max(0, entries[i].startMs);
     const endMs = Math.max(startMs + 100, entries[i].endMs);
     // Trim duration in seconds — cap each clip to its SRT slot.
@@ -411,15 +413,36 @@ async function mergeClipsWithTiming(
 
   const filter = filterParts.join(';');
 
-  const cmd =
-    `"${FFMPEG_PATH}" ${inputArgs.join(' ')} ` +
-    `-filter_complex "${filter}" ` +
-    `-map "[final]" -t ${totalDurationSec.toFixed(3)} ` +
-    `-ac 1 -ar 44100 -ab 128k "${outputPath}" -y`;
+  // Write the filter graph to a temp file and invoke ffmpeg with
+  // `-filter_complex_script`. This keeps the giant per-SRT-entry filter
+  // string out of the OS command line, so we don't hit ENAMETOOLONG on
+  // long SRTs (Windows shell limit ~8KB, CreateProcess argv limit ~32KB).
+  // execFile + argv array also avoids shell interpretation of clip paths
+  // (no quoting/escaping needed for paths with spaces or special chars).
+  const filterFile = path.join(
+    os.tmpdir(),
+    `sleiz-merge-filter-${process.pid}-${Date.now()}-${++tempFileSeq}.txt`
+  );
+  fs.writeFileSync(filterFile, filter, 'utf8');
 
-  console.log('[ffmpeg] Merging audio with timing...');
+  const args: string[] = [];
+  for (const clipPath of clipPaths) {
+    args.push('-i', clipPath);
+  }
+  args.push(
+    '-filter_complex_script', filterFile,
+    '-map', '[final]',
+    '-t', totalDurationSec.toFixed(3),
+    '-ac', '1', '-ar', '44100', '-ab', '128k',
+    outputPath,
+    '-y'
+  );
+
+  console.log(`[ffmpeg] Merging ${clipPaths.length} audio clips with timing...`);
   try {
-    const { stderr } = await execAsync(cmd, { maxBuffer: 100 * 1024 * 1024 });
+    const { stderr } = await execFileAsync(FFMPEG_PATH, args, {
+      maxBuffer: 100 * 1024 * 1024,
+    });
     if (stderr) {
       // ffmpeg writes progress to stderr; show the last few lines for debugging.
       const tail = stderr.split('\n').filter(Boolean).slice(-3).join('\n');
@@ -428,6 +451,12 @@ async function mergeClipsWithTiming(
   } catch (error: any) {
     console.error('[ffmpeg] Merge failed:', error.message);
     throw error;
+  } finally {
+    try {
+      fs.unlinkSync(filterFile);
+    } catch {
+      // best-effort cleanup; tmp file gets reaped by the OS either way
+    }
   }
 
   if (!fs.existsSync(outputPath)) {
