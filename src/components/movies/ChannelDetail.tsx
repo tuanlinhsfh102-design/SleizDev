@@ -44,11 +44,22 @@ import {
   CheckCircle2,
   Clock,
   AlertCircle,
+  Gauge,
+  Volume2,
+  Music,
 } from 'lucide-react';
 import { useAppStore } from '@/lib/store';
-import { Movie } from '@/types';
+import { Movie, TTS_VOICES } from '@/types';
 import { toast } from 'sonner';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
+import { Slider } from '@/components/ui/slider';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 interface ChannelDetailProps {
   channelId: string;
@@ -72,6 +83,9 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
     description: '',
     thumbnail_url: '',
     tts_voice: 'vi_vn_1',
+    tts_rate: '1.0',
+    tts_volume: 1.0,
+    bgm_volume: 0.03,
   });
 
   const fetchMovies = useCallback(async () => {
@@ -95,7 +109,16 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
 
   const handleOpenCreate = () => {
     setEditingMovie(null);
-    setFormData({ title: '', episode: '', description: '', thumbnail_url: '', tts_voice: 'vi_vn_1' });
+    setFormData({
+      title: '',
+      episode: '',
+      description: '',
+      thumbnail_url: '',
+      tts_voice: 'vi_vn_1',
+      tts_rate: '1.0',
+      tts_volume: 1.0,
+      bgm_volume: 0.03,
+    });
     setDialogOpen(true);
   };
 
@@ -107,6 +130,9 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
       description: movie.description || '',
       thumbnail_url: movie.thumbnail_url || '',
       tts_voice: movie.tts_voice || 'vi_vn_1',
+      tts_rate: movie.tts_rate || '1.0',
+      tts_volume: movie.tts_volume ?? 1.0,
+      bgm_volume: movie.bgm_volume ?? 0.03,
     });
     setDialogOpen(true);
   };
@@ -162,6 +188,9 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
             description: formData.description,
             thumbnail_url: formData.thumbnail_url,
             tts_voice: formData.tts_voice,
+            tts_rate: formData.tts_rate,
+            tts_volume: formData.tts_volume,
+            bgm_volume: formData.bgm_volume,
           })
           .eq('id', editingMovie.id);
         if (error) throw error;
@@ -175,6 +204,9 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
             description: formData.description,
             thumbnail_url: formData.thumbnail_url,
             tts_voice: formData.tts_voice,
+            tts_rate: formData.tts_rate,
+            tts_volume: formData.tts_volume,
+            bgm_volume: formData.bgm_volume,
             channel_id: channelId,
             status: 'draft',
           });
@@ -462,6 +494,112 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
                 onChange={(e) => setFormData({ ...formData, description: e.target.value })}
                 className="bg-slate-800 border-slate-700 text-white min-h-[60px]"
               />
+            </div>
+
+            {/* TTS Voice + Audio Settings */}
+            <div className="space-y-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700">
+              <div className="flex items-center gap-2 text-sm text-slate-200 font-medium">
+                <Volume2 className="w-4 h-4 text-rose-400" />
+                Cài đặt âm thanh lồng tiếng
+              </div>
+
+              {/* TTS Voice selector */}
+              <div className="space-y-1.5">
+                <Label className="text-xs text-slate-400">Giọng đọc</Label>
+                <Select
+                  value={formData.tts_voice}
+                  onValueChange={(value) => setFormData({ ...formData, tts_voice: value })}
+                >
+                  <SelectTrigger className="bg-slate-800 border-slate-700 text-white">
+                    <SelectValue placeholder="Chọn giọng đọc" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-slate-800 border-slate-700 text-white">
+                    {TTS_VOICES.map((voice) => (
+                      <SelectItem key={voice.id} value={voice.id}>
+                        {voice.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* TTS Rate slider */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-slate-400 flex items-center gap-1">
+                    <Gauge className="w-3 h-3" />
+                    Tốc độ giọng đọc
+                  </Label>
+                  <span className="text-xs text-white font-mono">
+                    {parseFloat(formData.tts_rate).toFixed(1)}x
+                  </span>
+                </div>
+                <Slider
+                  value={[parseFloat(formData.tts_rate)]}
+                  onValueChange={(value) => setFormData({ ...formData, tts_rate: value[0].toFixed(2) })}
+                  min={0.5}
+                  max={2.0}
+                  step={0.1}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500">
+                  <span>0.5x (chậm)</span>
+                  <span>1.0x (bình thường)</span>
+                  <span>2.0x (nhanh)</span>
+                </div>
+              </div>
+
+              {/* TTS Volume slider */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-slate-400 flex items-center gap-1">
+                    <Volume2 className="w-3 h-3" />
+                    Âm lượng giọng đọc Việt
+                  </Label>
+                  <span className="text-xs text-white font-mono">
+                    {Math.round(formData.tts_volume * 100)}%
+                  </span>
+                </div>
+                <Slider
+                  value={[formData.tts_volume]}
+                  onValueChange={(value) => setFormData({ ...formData, tts_volume: value[0] })}
+                  min={0}
+                  max={1.5}
+                  step={0.05}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500">
+                  <span>0% (tắt)</span>
+                  <span>100% (mặc định)</span>
+                  <span>150% (to)</span>
+                </div>
+              </div>
+
+              {/* BGM Volume slider */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <Label className="text-xs text-slate-400 flex items-center gap-1">
+                    <Music className="w-3 h-3" />
+                    Âm lượng âm thanh gốc (nền)
+                  </Label>
+                  <span className="text-xs text-white font-mono">
+                    {Math.round(formData.bgm_volume * 100)}%
+                  </span>
+                </div>
+                <Slider
+                  value={[formData.bgm_volume]}
+                  onValueChange={(value) => setFormData({ ...formData, bgm_volume: value[0] })}
+                  min={0}
+                  max={0.5}
+                  step={0.01}
+                  className="w-full"
+                />
+                <div className="flex justify-between text-[10px] text-slate-500">
+                  <span>0% (tắt hẳn)</span>
+                  <span>3% (nền nhẹ — mặc định)</span>
+                  <span>50% (to)</span>
+                </div>
+              </div>
             </div>
 
             <DialogFooter>

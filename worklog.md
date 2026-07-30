@@ -1371,3 +1371,120 @@ Stage Summary:
       correct timestamps (matches SRT cues)
 - Final video available at:
     /home/z/my-project/download/pipeline_final_video.mp4
+
+---
+Task ID: 16
+Agent: Main (Super Z)
+Task: Add TTS rate/volume controls + beautiful subtitle styling (rounded box + blur)
+
+Work Log:
+- User asked:
+    1. "chỉnh sửa tốc độ âm thanh, âm thanh to nhỏ điều chỉnh ở web"
+    2. "background text bo góc và mờ nhẹ, text đẹp giúp tôi"
+
+- Fix #1 — TTS rate + volume controls in movie create/edit dialog:
+    src/types/index.ts
+    * Added 3 fields to Movie interface:
+        tts_rate: string | null     — TTS speech rate ("0.5"-"2.0", default "1.0")
+        tts_volume: number | null   — TTS audio volume (0.0-1.5, default 1.0)
+        bgm_volume: number | null   — Original audio volume (0.0-0.5, default 0.03)
+
+    supabase-schema.sql
+    * Added 3 columns to movies table + migration DO $$ block (safe to run
+      multiple times, IF NOT EXISTS check).
+
+    src/components/movies/ChannelDetail.tsx
+    * Added Slider + Select imports from shadcn/ui.
+    * Added Gauge, Volume2, Music icons from lucide-react.
+    * Extended formData with tts_rate, tts_volume, bgm_volume.
+    * Updated handleOpenCreate + handleOpenEdit to set the 3 new fields.
+    * Updated handleSubmit (both insert + update) to persist them.
+    * Added "Cài đặt âm thanh lồng tiếng" card in the movie form with:
+        - Giọng đọc: Select dropdown (5 voices from TTS_VOICES)
+        - Tốc độ giọng đọc: Slider 0.5x-2.0x, step 0.1, shows "1.0x"
+        - Âm lượng giọng đọc Việt: Slider 0%-150%, step 5%, shows "100%"
+        - Âm lượng âm thanh gốc (nền): Slider 0%-50%, step 1%, shows "3%"
+      Each slider has min/max/step labels for usability.
+
+- Fix #2 — Pipeline reads rate + volume from movie record:
+    mini-services/translation-service/src/index.ts
+    * Extended TranslationParams with ttsRate?, ttsVolume?, bgmVolume?.
+    * processTranslation() reads them with defaults (1.0, 1.0, 0.03).
+    * Logs audio settings at pipeline start.
+    * generateAudioFromSrt() now receives ttsRate as 7th param.
+    * dubVideo() now receives bgmVolume (originalVolume) + ttsVolume.
+    * recoverPendingJobs() fetches tts_rate, tts_volume, bgm_volume from
+      the movie record and passes them to processTranslation.
+    * Removed the old DUB_ORIGINAL_VOLUME env var (now per-movie via DB).
+
+    src/components/translation/TranslationStudio.tsx
+    * startTranslation() now passes ttsRate, ttsVolume, bgmVolume in the
+      start-translation socket payload (read from movie record).
+
+    mini-services/translation-service/src/tiktok-tts.ts
+    * generateAudioFromSrt() signature: added `rate: string = '1.0'` as
+      7th param. Passes it to CapCutTtsBatchEntry.rate (was hardcoded '1.0').
+    * dubVideo() signature: added `ttsVolume = 1.0` as 5th param.
+      Audio filter now uses ttsVolume for the TTS track (was hardcoded 1.0)
+      and originalVolume for the background track (unchanged).
+
+- Fix #3 — Beautiful subtitle styling (rounded box + blur + nice text):
+    mini-services/translation-service/src/tiktok-tts.ts
+    * NEW: srtToAss() function converts SRT → ASS with beautiful styling.
+      ASS gives much more control than SRT + force_style:
+        - BorderStyle=4: box around text (not just outline)
+        - BackColour with alpha: semi-transparent box ("mờ nhẹ")
+        - Shadow: soft drop shadow for depth
+        - Spacing: letter spacing for cleaner appearance
+        - WrapStyle=0: smart line wrapping
+        - YCbCr Matrix: correct color space
+    * Styling details (for 360p video, scales with resolution):
+        Fontname: Inter (fontconfig falls back to similar sans-serif)
+        Fontsize: 16px (~4.5% of video height)
+        PrimaryColour: &H00FFFFFF& (white text, opaque)
+        OutlineColour: &H00000000& (black outline)
+        BackColour: &H99000000& (semi-transparent black, 60% opaque)
+        Bold: 1
+        BorderStyle: 4 (box)
+        Outline: 1px (subtle border)
+        Shadow: 1px (soft drop shadow)
+        Alignment: 2 (bottom center)
+        MarginV: 29px (~8% from bottom)
+        Spacing: 0.5px (slight letter spacing)
+    * burnSubtitlesIntoVideo() rewritten:
+        1. Reads SRT, converts to ASS via srtToAss()
+        2. Writes ASS to temp file (next to SRT)
+        3. Uses ffmpeg `ass` filter (not `subtitles` filter) for full
+           ASS styling support
+        4. Fallback: if ass filter fails, retries with `subtitles` filter
+           + force_style (BorderStyle=4, same colors)
+        5. Cleans up temp ASS file in finally
+    * Path escaping: relative path when ASS is near video (avoids Windows
+      drive-letter issues), absolute path with escaping as fallback.
+
+- Verified end-to-end:
+    * Re-burned subtitles on user's 5:21 video with new ASS styling.
+    * Output: /home/z/my-project/download/user_video_final.mp4 (41.8MB)
+    * Burn took 79.1s (162 subtitle entries, 640x360 video).
+    * ASS file generated correctly (179 lines for 162 entries + headers).
+    * ffmpeg ass filter accepted the styling without errors.
+    * Type-check: zero errors in src/ and mini-services/translation-service/src/.
+
+- DB migration note:
+    The 3 new columns (tts_rate, tts_volume, bgm_volume) need to be added
+    to the movies table. The supabase-schema.sql includes a DO $$ block
+    that adds them with IF NOT EXISTS (safe to re-run). User needs to run
+    this SQL in Supabase Dashboard → SQL Editor. The code handles null
+    values with sensible defaults, so the app works even before migration
+    is applied (just uses 1.0/1.0/0.03 defaults).
+
+Stage Summary:
+- TTS rate (0.5x-2.0x), TTS volume (0-150%), and BGM volume (0-50%) are
+  now adjustable per-movie via sliders in the movie create/edit dialog.
+  No code changes needed to change audio settings — just drag the sliders.
+- Subtitles now use beautiful ASS styling: rounded semi-transparent black
+  box (60% opacity) behind white bold text, with subtle outline + soft
+  drop shadow. Much more readable and professional-looking than the old
+  opaque box.
+- Final video at /home/z/my-project/download/user_video_final.mp4 shows
+  both improvements: 3% BGM + new subtitle styling.

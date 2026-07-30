@@ -100,6 +100,12 @@ interface TranslationParams {
   userId: string;
   apiKeys: { gemini?: string; capcut?: string; tiktok?: string };
   ttsVoice: string;
+  /** TTS speech rate multiplier (e.g. "1.0", "0.9", "1.2"). Default "1.0". */
+  ttsRate?: string;
+  /** TTS audio volume in final mix (0.0 - 1.5). Default 1.0. */
+  ttsVolume?: number;
+  /** Original audio (background) volume in final mix (0.0 - 0.5). Default 0.03. */
+  bgmVolume?: number;
   movieTitle: string;
   episode: string;
   channelName: string;
@@ -288,6 +294,15 @@ async function fetchPreviousTranslations(movieId: string): Promise<string[]> {
  */
 async function processTranslation(params: TranslationParams, socket?: Socket) {
   const { movieId, jobId, videoUrl, userId, apiKeys, ttsVoice, movieTitle, episode } = params;
+  // Audio settings with defaults — overridable per-movie via DB columns
+  // tts_rate, tts_volume, bgm_volume (set from the movie create/edit dialog).
+  const ttsRate = params.ttsRate || '1.0';
+  const ttsVolume = params.ttsVolume ?? 1.0;
+  const bgmVolume = params.bgmVolume ?? 0.03;
+  console.log(
+    `[pipeline] Audio settings: voice=${ttsVoice} rate=${ttsRate} ` +
+      `tts_volume=${(ttsVolume * 100).toFixed(0)}% bgm_volume=${(bgmVolume * 100).toFixed(0)}%`
+  );
 
   // Resolve Supabase client up-front so we get a clear actionable error
   // before doing any video download / audio extraction work. (If supabase
@@ -356,18 +371,17 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
       async (current, total) => {
         const progress = 60 + Math.floor((current / total) * 15);
         await updateJobProgress(jobId, movieId, 'generating_tts', progress, `Đang tạo giọng nói ${current + 1}/${total}...`, socket);
-      }
+      },
+      ttsRate
     );
 
     // Step 6: Dub the video (replace original audio with Vietnamese TTS audio)
-    // originalVolume controls how loud the original Chinese audio is in the
-    // final mix (background ambience). Default 0.03 = 3% — just enough to
-    // hear music/sound effects but not drown out the Vietnamese TTS voice.
-    // Override via DUB_ORIGINAL_VOLUME env var (0.0 = mute original, 1.0 = full).
-    const originalVolume = parseFloat(process.env.DUB_ORIGINAL_VOLUME || '0.03');
+    // bgmVolume = original Chinese audio level (background ambience, default 3%).
+    // ttsVolume = Vietnamese TTS audio level (default 100%).
+    // Both come from the movie record (set via the create/edit dialog sliders).
     await updateJobProgress(jobId, movieId, 'dubbing', 78, 'Đang lồng tiếng vào video...', socket);
     const dubbedVideoPath = path.join(workDir, 'dubbed.mp4');
-    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, originalVolume);
+    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, bgmVolume, ttsVolume);
 
     // Step 6.5: Burn Vietnamese subtitles into the video (chèn chữ vào video)
     // This renders the SRT text directly onto the video frames, so the
@@ -547,10 +561,11 @@ async function recoverPendingJobs() {
 
   for (const job of pendingJobs) {
     try {
-      // Fetch the movie to get video_url, tts_voice, title, episode
+      // Fetch the movie to get video_url, tts_voice, tts_rate, tts_volume,
+      // bgm_volume, title, episode
       const { data: movie } = await supabase
         .from('movies')
-        .select('id, title, episode, video_url, tts_voice, channel_id')
+        .select('id, title, episode, video_url, tts_voice, tts_rate, tts_volume, bgm_volume, channel_id')
         .eq('id', job.movie_id)
         .single();
       if (!movie?.video_url) {
@@ -587,6 +602,9 @@ async function recoverPendingJobs() {
           userId: job.user_id,
           apiKeys,
           ttsVoice: movie.tts_voice || 'vi_vn_1',
+          ttsRate: movie.tts_rate || '1.0',
+          ttsVolume: movie.tts_volume ?? 1.0,
+          bgmVolume: movie.bgm_volume ?? 0.03,
           movieTitle: movie.title,
           episode: movie.episode || '',
           channelName: '',

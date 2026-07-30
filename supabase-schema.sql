@@ -48,9 +48,30 @@ CREATE TABLE IF NOT EXISTS public.movies (
   dubbed_video_url TEXT,
   ai_description TEXT,
   tts_voice TEXT DEFAULT 'vi_vn_1',
+  tts_rate TEXT DEFAULT '1.0',
+  tts_volume REAL DEFAULT 1.0,
+  bgm_volume REAL DEFAULT 0.03,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- Migration: add tts_rate, tts_volume, bgm_volume columns to existing movies table.
+-- Safe to run multiple times (IF NOT EXISTS).
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'movies' AND column_name = 'tts_rate') THEN
+    ALTER TABLE public.movies ADD COLUMN tts_rate TEXT DEFAULT '1.0';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'movies' AND column_name = 'tts_volume') THEN
+    ALTER TABLE public.movies ADD COLUMN tts_volume REAL DEFAULT 1.0;
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'movies' AND column_name = 'bgm_volume') THEN
+    ALTER TABLE public.movies ADD COLUMN bgm_volume REAL DEFAULT 0.03;
+  END IF;
+END $$;
 
 ALTER TABLE public.movies ENABLE ROW LEVEL SECURITY;
 

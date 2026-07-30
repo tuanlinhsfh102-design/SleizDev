@@ -24,6 +24,12 @@ export interface Movie {
   dubbed_video_url: string | null;
   ai_description: string | null;
   tts_voice: string | null;
+  /** TTS speech rate multiplier (e.g. "1.0" = normal, "0.9" = slower, "1.2" = faster). Default "1.0". */
+  tts_rate: string | null;
+  /** TTS audio volume in final mix (0.0 = silent, 1.0 = full, 1.5 = boosted). Default 1.0. */
+  tts_volume: number | null;
+  /** Original audio (background) volume in final mix (0.0 = muted, 0.03 = 3% ambience, 0.1 = 10%). Default 0.03. */
+  bgm_volume: number | null;
   created_at: string;
   updated_at: string;
 }

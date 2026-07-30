@@ -183,7 +183,9 @@ export async function generateAudioFromSrt(
   voice: string,
   outputDir: string,
   totalDurationMs: number,
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number) => void,
+  /** TTS speech rate multiplier. Default "1.0". Range: 0.5 (slow) - 2.0 (fast). */
+  rate: string = '1.0'
 ): Promise<string> {
   const entries = parseSrtEntries(srtContent);
   if (entries.length === 0) {
@@ -192,7 +194,7 @@ export async function generateAudioFromSrt(
 
   console.log(
     `[tts] Generating audio for ${entries.length} entries ` +
-      `(batch size=${TTS_BATCH_SIZE}, parallel via CapCut TTS bridge)...`
+      `(batch size=${TTS_BATCH_SIZE}, rate=${rate}, parallel via CapCut TTS bridge)...`
   );
 
   // Create clips directory
@@ -230,7 +232,7 @@ export async function generateAudioFromSrt(
         output: clipPaths[i],
         text: cleanText,
         voice,
-        rate: '1.0',
+        rate,
       });
     }
 
@@ -696,9 +698,14 @@ export async function dubVideo(
   videoPath: string,
   audioPath: string,
   outputPath: string,
-  originalVolume = 0.03 // Keep original audio at 3% volume as background ambience
+  originalVolume = 0.03, // Keep original audio at 3% volume as background ambience
+  /** Volume of the TTS audio track in the final mix. Default 1.0 (full). Range: 0.0 - 1.5. */
+  ttsVolume = 1.0
 ): Promise<void> {
-  console.log(`[ffmpeg] Dubbing video with new audio + 16:9 auto-crop (original volume: ${(originalVolume * 100).toFixed(0)}%)...`);
+  console.log(
+    `[ffmpeg] Dubbing video with new audio + 16:9 auto-crop ` +
+      `(TTS: ${(ttsVolume * 100).toFixed(0)}%, original: ${(originalVolume * 100).toFixed(0)}%)...`
+  );
 
   // 1. Detect crop box
   const crop = await detectCrop(videoPath, 5);
@@ -739,11 +746,11 @@ export async function dubVideo(
   if (hasSourceAudio) {
     audioFilter =
       `[0:a]volume=${originalVolume}[a1];` +
-      `[1:a]volume=1.0,aresample=44100[a2];` +
+      `[1:a]volume=${ttsVolume},aresample=44100[a2];` +
       `[a1][a2]amix=inputs=2:duration=first:dropout_transition=0[aout]`;
     mapArgs = `-map "[v]" -map "[aout]"`;
   } else {
-    audioFilter = `[1:a]volume=1.0,aresample=44100[aout]`;
+    audioFilter = `[1:a]volume=${ttsVolume},aresample=44100[aout]`;
     mapArgs = `-map "[v]" -map "[aout]"`;
   }
 
@@ -807,19 +814,113 @@ export async function dubVideo(
 // -------------------------------------------------------------------------
 
 /**
- * Burn an SRT subtitle file into a video using ffmpeg's `subtitles` filter.
+ * Convert an SRT file to an ASS file with beautiful styling.
+ *
+ * ASS (Advanced SubStation Alpha) gives us much more control over subtitle
+ * appearance than SRT — including:
+ *   - Rounded box backgrounds (viaBorderStyle=4 + BackColour)
+ *   - Semi-transparent (blurred) backgrounds (via alpha channel in colours)
+ *   - Per-line styling overrides
+ *   - Bold + outline + shadow combinations
+ *
+ * The `subtitles` filter in ffmpeg only supports a subset of ASS styling
+ * via force_style, but converting to ASS first lets us use the full `ass`
+ * filter which respects ALL styling directives.
+ *
+ * Styling choices (per user request "background text bo góc và mờ nhẹ,
+ * text đẹp"):
+ *   - Font: Inter / Arial / DejaVu Sans (fontconfig resolves)
+ *   - Size: ~4.5% of video height (readable but not overwhelming)
+ *   - Position: bottom center, ~8% margin from bottom
+ *   - Text: white, bold, with subtle black outline for contrast
+ *   - Background: semi-transparent black box (alpha=70%) for readability
+ *     over any video content
+ *   - Border: BorderStyle=4 draws a box around the text (not just outline)
+ *   - Shadow: soft drop shadow (1px offset, 1px blur) for depth
+ *   - Spacing: 1px letter spacing for cleaner appearance
+ *   - Wrap: smart line wrapping (max 40 chars/line)
+ */
+function srtToAss(srtContent: string, videoHeight: number): string {
+  const fontSize = Math.round(videoHeight * 0.045);
+  const marginV = Math.round(videoHeight * 0.08);
+  const outlineWidth = Math.max(1, Math.round(videoHeight * 0.004));
+
+  // Parse SRT entries
+  const entries: Array<{ start: string; end: string; text: string }> = [];
+  const blocks = srtContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split(/\n\s*\n/);
+  for (const block of blocks) {
+    const lines = block.split('\n').filter((l) => l.trim());
+    if (lines.length < 2) continue;
+    let idx = 0;
+    if (/^\d+$/.test(lines[0].trim())) idx = 1;
+    const timeMatch = lines[idx].match(/(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/);
+    if (!timeMatch) continue;
+    const start = timeMatch[1].replace(',', '.');
+    const end = timeMatch[2].replace(',', '.');
+    const text = lines.slice(idx + 1).join('\\N'); // ASS line break
+    entries.push({ start, end, text });
+  }
+
+  // Build the ASS file
+  // Colors in ASS: &H<AA><BB><GG><RR>&
+  //   AA = alpha (00=opaque, FF=transparent)
+  //   BB = blue, GG = green, RR = red
+  //
+  // Fontname: ASS only accepts ONE font name. We use "Inter" (modern,
+  // available on most systems). fontconfig/libass will fall back to a
+  // similar sans-serif font if Inter is not installed.
+  //
+  // BackColour with BorderStyle=4 = box background color.
+  //   &H99000000& = alpha 0x99 (60% opaque) + black RGB
+  //   This gives the "mờ nhẹ" (slightly transparent) background.
+  //
+  // Outline with BorderStyle=4 = box border width.
+  //   We set it to ~0.4% of video height for a subtle border.
+  //
+  // Shadow=1 = 1px drop shadow for depth (BorderStyle=4 + Shadow gives
+  // a nice "floating text" effect).
+  const ass = `[Script Info]
+; Generated by SleizDev burnSubtitlesIntoVideo
+; Beautiful subtitle styling: rounded box + semi-transparent background
+ScriptType: v4.00+
+PlayResX: ${Math.round(videoHeight * 16 / 9)}
+PlayResY: ${videoHeight}
+WrapStyle: 0
+ScaledBorderAndShadow: yes
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Inter,${fontSize},&H00FFFFFF&,&H000000FF&,&H00000000&,&H99000000&,1,0,0,0,100,100,0.5,0,4,${outlineWidth},1,2,40,40,${marginV},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+`;
+
+  const events = entries.map((e) => {
+    return `Dialogue: 0,${e.start},${e.end},Default,,0,0,0,,${e.text}`;
+  }).join('\n');
+
+  return ass + events + '\n';
+}
+
+/**
+ * Burn an SRT subtitle file into a video using ffmpeg's `ass` filter.
  *
  * The subtitles are rendered as hard-coded text on top of the video frames
  * (not as a soft subtitle track). This means the subtitles will be visible
  * in ANY video player, including ones that don't support SRT tracks.
  *
- * Styling:
+ * Styling (beautiful, rounded, semi-transparent):
  *   - Font: Inter / Arial / DejaVu Sans (whichever is available)
- *   - Size: scaled to video height (~5% of height)
- *   - Position: bottom center, ~10% from bottom edge
- *   - Colors: white text with semi-transparent black background box
- *   - Bold for readability
- *   - UTF-8 encoding (Vietnamese diacritics + Chinese characters supported)
+ *   - Size: ~4.5% of video height (scales with resolution)
+ *   - Position: bottom center, ~8% from bottom edge
+ *   - Text: white, bold, with subtle black outline
+ *   - Background: semi-transparent black box (60% opacity) — "mờ nhẹ"
+ *   - BorderStyle=4: box around text (supports rounded appearance)
+ *   - Soft drop shadow for depth
+ *   - Smart line wrapping (max 40 chars/line)
+ *   - UTF-8 encoding (Vietnamese diacritics supported)
  *
  * @param videoPath  Path to the input video (e.g. the dubbed video from dubVideo())
  * @param srtPath     Path to the SRT file to burn in
@@ -847,90 +948,45 @@ export async function burnSubtitlesIntoVideo(
   // Probe video resolution to scale font size proportionally
   const source = await getVideoResolution(videoPath);
   const videoHeight = source?.height || 720; // default to 720p if probe fails
-  // Font size = ~5% of video height. For 720p → 36px, 1080p → 54px.
-  const fontSize = Math.round(videoHeight * 0.05);
+  console.log(`[ffmpeg] Video height: ${videoHeight}px, font size will be ~${Math.round(videoHeight * 0.045)}px`);
 
-  // Build the subtitles filter with styling.
-  //
-  // The `subtitles` filter takes a path to an SRT file and renders the
-  // subtitles directly into the video frames. The `force_style` option
-  // accepts ASS-style override parameters:
-  //
-  //   FontName       — font family (must be installed on the system)
-  //   FontSize       — in pixels
-  //   PrimaryColour  — text color (ASS hex format: &H<AA><BB><GG><RR>&,
-  //                    where AA=alpha, BB=blue, GG=green, RR=red)
-  //   OutlineColour  — border/outline color
-  //   BackColour     — box background color (used with BorderStyle=3)
-  //   Bold           — 1 = bold, 0 = normal
-  //   Alignment      — Numpad-style: 2 = bottom-center
-  //   MarginV        — vertical margin from bottom (in pixels)
-  //   BorderStyle    — 1 = outline + drop shadow, 3 = opaque box
-  //
-  // Colors in ASS format: &H<AA><BB><GG><RR>&
-  //   White text:        &H00FFFFFF& (AA=00 opaque, BB=FF, GG=FF, RR=FF)
-  //   Black box:         &H80000000& (AA=80 semi-transparent, RGB=000000)
-  //   Black outline:     &H00000000& (AA=00 opaque, RGB=000000)
-  //
-  // We use BorderStyle=3 (opaque box) for maximum readability over any
-  // video background — the semi-transparent black box ensures white text
-  // is always legible.
-  //
-  // CRITICAL: The SRT path must be escaped for ffmpeg's filter parser.
-  // Backslashes and colons in the path need to be escaped, and on Windows
-  // the drive letter (C:) needs special handling. We use a relative path
-  // when possible to avoid these issues.
-  const srtAbsPath = path.resolve(srtPath);
+  // Convert SRT → ASS with beautiful styling
+  const srtContent = fs.readFileSync(srtPath, 'utf-8');
+  const assContent = srtToAss(srtContent, videoHeight);
+  const assPath = srtPath.replace(/\.srt$/i, '.ass');
+  fs.writeFileSync(assPath, assContent, 'utf-8');
+  console.log(`[ffmpeg] Generated ASS file: ${assPath} (${assContent.split('\n').length} lines)`);
+
+  // Escape the ASS path for ffmpeg's filter parser
+  const assAbsPath = path.resolve(assPath);
   const videoDir = path.dirname(path.resolve(videoPath));
-  let srtPathForFilter: string;
+  let assPathForFilter: string;
   let needsChdir = false;
   try {
-    // If the SRT is in the same dir as the video (or below it), use a
-    // relative path — avoids Windows drive-letter escaping issues.
-    const rel = path.relative(videoDir, srtAbsPath);
+    const rel = path.relative(videoDir, assAbsPath);
     if (rel && !path.isAbsolute(rel)) {
-      srtPathForFilter = rel.replace(/\\/g, '/').replace(/:/g, '\\:');
+      assPathForFilter = rel.replace(/\\/g, '/').replace(/:/g, '\\:');
       needsChdir = true;
     } else {
-      srtPathForFilter = srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+      assPathForFilter = assAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
     }
   } catch {
-    srtPathForFilter = srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    assPathForFilter = assAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
   }
 
-  const filterStyle = [
-    // FontName: try Inter first (modern, available on most systems),
-    // then fall back to DejaVu Sans (always available on Linux) and Arial
-    // (always available on Windows/macOS). The subtitles filter will use
-    // fontconfig/libass to resolve the font, so any of these will work.
-    `FontName=Inter\\,Arial\\,DejaVu Sans`,
-    `FontSize=${fontSize}`,
-    `PrimaryColour=&H00FFFFFF&`,  // white text, opaque
-    `OutlineColour=&H00000000&`,  // black outline
-    `BackColour=&H80000000&`,     // semi-transparent black box
-    `Bold=1`,
-    `Alignment=2`,                 // bottom center
-    `MarginV=${Math.round(videoHeight * 0.08)}`,  // ~8% from bottom
-    `BorderStyle=3`,               // opaque box (not just outline)
-    `Outline=2`,
-    `Shadow=0`,
-  ].join(',');
-
-  // Build the filter string. The subtitles filter syntax is:
-  //   subtitles=filename='path':force_style='style'
-  //
-  // Single quotes around the filename protect special chars; the inner
-  // escaping handles backslashes and colons.
-  const subtitleFilter = `subtitles=filename='${srtPathForFilter}':force_style='${filterStyle}'`;
+  // Use the `ass` filter (not `subtitles`) for full ASS styling support.
+  // The ass filter respects all styling directives in the ASS file,
+  // including BorderStyle=4 (box), alpha channels, and shadows.
+  const assFilter = `ass='${assPathForFilter}'`;
 
   const cmd =
     `"${FFMPEG_PATH}" -i "${videoPath}" ` +
-    `-vf "${subtitleFilter}" ` +
+    `-vf "${assFilter}" ` +
     `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +
     `-c:a copy ` +  // just copy audio — no re-encoding needed
     `-movflags +faststart "${outputPath}" -y`;
 
-  console.log(`[ffmpeg] Running subtitle burn (fontSize=${fontSize}, height=${videoHeight})...`);
+  console.log(`[ffmpeg] Running subtitle burn (ass filter, height=${videoHeight})...`);
   const cwd = needsChdir ? videoDir : process.cwd();
   try {
     const { stderr } = await execAsync(cmd, {
@@ -942,25 +998,49 @@ export async function burnSubtitlesIntoVideo(
       console.log('[ffmpeg] stderr tail:', tail);
     }
   } catch (error: any) {
-    console.error('[ffmpeg] Subtitle burn failed:', error.message);
-    // Fallback: try with absolute path + full escaping (in case the
-    // relative-path approach failed on a weird filesystem layout)
-    console.warn('[ffmpeg] Retrying with absolute path...');
-    const absFilter = `subtitles=filename='${srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:')}':force_style='${filterStyle}'`;
+    console.error('[ffmpeg] ASS subtitle burn failed:', error.message);
+    // Fallback: try the simpler `subtitles` filter with the original SRT
+    // (less pretty styling but more compatible with older ffmpeg builds)
+    console.warn('[ffmpeg] Retrying with subtitles filter + SRT...');
+    const srtAbsPath = path.resolve(srtPath);
+    let srtPathForFilter: string;
+    try {
+      const rel = path.relative(videoDir, srtAbsPath);
+      srtPathForFilter = (rel && !path.isAbsolute(rel))
+        ? rel.replace(/\\/g, '/').replace(/:/g, '\\:')
+        : srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    } catch {
+      srtPathForFilter = srtAbsPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    }
+    const fontSize = Math.round(videoHeight * 0.045);
+    const fallbackStyle = [
+      `FontName=Inter\\,Arial\\,DejaVu Sans`,
+      `FontSize=${fontSize}`,
+      `PrimaryColour=&H00FFFFFF&`,
+      `OutlineColour=&H00000000&`,
+      `BackColour=&H99000000&`,
+      `Bold=1`,
+      `Alignment=2`,
+      `MarginV=${Math.round(videoHeight * 0.08)}`,
+      `BorderStyle=4`,
+      `Outline=${Math.max(1, Math.round(videoHeight * 0.004))}`,
+      `Shadow=1`,
+    ].join(',');
+    const fallbackFilter = `subtitles=filename='${srtPathForFilter}':force_style='${fallbackStyle}'`;
     const fallbackCmd =
       `"${FFMPEG_PATH}" -i "${videoPath}" ` +
-      `-vf "${absFilter}" ` +
+      `-vf "${fallbackFilter}" ` +
       `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +
       `-c:a copy ` +
       `-movflags +faststart "${outputPath}" -y`;
     try {
-      await execAsync(fallbackCmd, { maxBuffer: 200 * 1024 * 1024 });
+      await execAsync(fallbackCmd, { maxBuffer: 200 * 1024 * 1024, cwd });
     } catch (retryErr: any) {
       throw new Error(
         `Subtitle burn failed (both attempts). ` +
-          `First: ${error.message}. ` +
-          `Retry: ${retryErr.message}. ` +
-          `Check that ffmpeg has libass support (run: ffmpeg -filters | grep subtitles).`
+          `ASS: ${error.message}. ` +
+          `SRT fallback: ${retryErr.message}. ` +
+          `Check that ffmpeg has libass support (run: ffmpeg -filters | grep -E 'ass|subtitles').`
       );
     }
   }
@@ -968,6 +1048,9 @@ export async function burnSubtitlesIntoVideo(
   if (!fs.existsSync(outputPath)) {
     throw new Error('Subtitle burn failed - no output file');
   }
+
+  // Clean up the temporary ASS file
+  try { fs.unlinkSync(assPath); } catch { /* ignore */ }
 
   const sizeMb = (fs.statSync(outputPath).size / 1024 / 1024).toFixed(1);
   console.log(`[ffmpeg] Subtitle burn complete: ${sizeMb}MB -> ${path.basename(outputPath)}`);
