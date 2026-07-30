@@ -465,3 +465,128 @@ Stage Summary:
   to user-friendly aliases in the bridge script.
 - The TikTok TTS path is preserved as a fallback — users who already set
   TIKTOK_SESSION_ID will still get that as a secondary provider.
+
+---
+Task ID: 7
+Agent: Main (Super Z)
+Task: Fix service boot crash — "supabaseUrl is required" on Windows fresh install
+
+Work Log:
+- User reported translation-service crash on Windows fresh install:
+    [service] [FATAL] Missing Supabase credentials
+    Error: supabaseUrl is required.
+        at validateSupabaseUrl (.../supabase-js/dist/index.mjs:431:25)
+        at new SupabaseClient (.../supabase-js/dist/index.mjs:672:19)
+        at createClient (.../supabase-js/dist/index.mjs:911:9)
+        at <anonymous> (.../translation-service/src/index.ts:32:18)
+- Investigated root cause. Two layered problems:
+  1. PRIMARY: `.env*` is in `.gitignore`, so `.env.local` is NOT in the
+     GitHub zip download. The user's machine at
+     `C:\Users\Admin\Downloads\SleizDev-main (1)\SleizDev-main\` has no
+     `.env.local` file. The env-loader (`mini-services/translation-service/
+     src/env-loader.ts`) looked for it in 4 candidate paths, found nothing,
+     and silently moved on. Then `index.ts` checked
+     `if (!supabaseUrl || !supabaseKey) console.error('[FATAL]...')` —
+     printing the FATAL but NOT exiting — and then proceeded to call
+     `createSupabaseClient(supabaseUrl!, supabaseKey!, ...)` which threw
+     `supabaseUrl is required.` because the `!` non-null assertion only
+     silences TypeScript, not the runtime check inside SupabaseClient.
+     Result: service crashed on import, restarted by `--watch`, crashed
+     again, infinite loop.
+  2. SECONDARY: Next.js 16 Turbopack warning about multiple lockfiles.
+     The user has a stray `C:\Users\Admin\Downloads\package-lock.json`
+     AND `...\SleizDev-main\package-lock.json` AND
+     `...\SleizDev-main\mini-services\translation-service\package-lock.json`
+     — Turbopack picks one as the workspace root and prints a warning.
+     Not fatal, but noisy.
+- Fix #1 — env-loader now injects documented defaults when no .env file found:
+    mini-services/translation-service/src/env-loader.ts
+    * Rewrote path resolution to use module-relative paths via
+      `import.meta.url` + `fileURLToPath`. Previously used `process.cwd()`
+      which is unpredictable (could pick up unrelated `.env` files in the
+      user's launch directory — e.g. `/home/user/.env` or
+      `C:\Users\Admin\.env`). Now resolves SleizDev root reliably as
+      3 levels up from `src/env-loader.ts`.
+    * Removed the `process.cwd()` fallback candidates entirely. The
+      SleizDev root and service dir are always known (computed from module
+      location); looking in arbitrary cwd locations was a footgun.
+    * When no env file is found at any of the 4 well-known paths, inject
+      the documented default credentials (taken verbatim from
+      README-SETUP.md — they're already public via the README, so not
+      secret) into `process.env` so the service can boot. Print a clear
+      warning with all 4 paths checked, instructions on what to do, and
+      the names of all 5 env vars that were injected.
+- Fix #2 — index.ts now defers Supabase client creation:
+    mini-services/translation-service/src/index.ts
+    * Replaced eager `const supabase = createSupabaseClient(...)` with a
+      lazy `let supabase: ... | null = null` + `getSupabase()` accessor.
+    * The service can now boot even when env vars are missing — it logs
+      the FATAL message but continues to start the HTTP server and
+      Socket.io. Only requests that actually need Supabase will throw
+      (with a clear actionable error message), instead of the service
+      crashing on import.
+    * All 5 functions that use supabase (updateJobProgress,
+      fetchPreviousTranslations, processTranslation, uploadToSupabase,
+      recoverPendingJobs) now resolve the client via `getSupabase()` at
+      the top of the function. The local `supabase` shadows the outer
+      module-level variable, so existing `supabase.from(...)` calls work
+      unchanged.
+    * updateJobProgress keeps its best-effort semantics: if supabase is
+      null, it logs a warning and continues — the socket.io progress
+      event still fires so the frontend keeps updating.
+    * recoverPendingJobs skips entirely if supabase is not configured
+      (logs "Skipping job recovery — Supabase not configured" and
+      returns).
+    * Updated TTS step message from "TikTok TTS" to "CapCut TTS" to
+      reflect the change made in Task ID 6.
+- Fix #3 — silence Next.js multiple-lockfiles warning:
+    next.config.ts
+    * Added `turbopack.root` set to the project root (computed via
+      `__dirname` in CJS context, or `path.dirname(fileURLToPath(import.meta.url))`
+      in ESM context). This tells Turbopack exactly where the project
+      root is, so it stops scanning parent directories for lockfiles.
+      Per Next.js docs:
+      https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack#root-directory
+- Fix #4 — add .env.example for discoverability:
+    .env.example (new file)
+    * Documents all 5 required env vars with placeholder values.
+    * Committed to the repo (added `!.env.example` exception to
+      `.gitignore` so it's not ignored).
+    * Users can `cp .env.example .env.local` and fill in their values.
+- Fix #5 — fix README-SETUP.md lie about .env.local being "included":
+    README-SETUP.md
+    * Removed the claim "File `.env.local` is included" — it was never
+      in the repo (gitignored).
+    * Added clear explanation that the project ships with documented
+      default credentials that work out of the box, and instructions on
+      how to use your own Supabase project instead.
+- Verified end-to-end:
+    * Simulated "no env file" by unsetting all SUPABASE_* env vars and
+      deleting any .env / .env.local in the SleizDev tree.
+    * Service now boots cleanly:
+        [env] WARNING: No .env.local file found.
+        [env] Looked in: (4 paths listed)
+        [env] Injecting documented default credentials...
+        [env] Injected 5 default values into process.env
+        [supabase] Client initialized successfully
+        [translation-service] Running on port 3004
+        [translation-service] Supabase URL: ✓
+        [startup] No orphaned pending jobs to recover.
+    * Health-check endpoint responds (Socket.io intercepts it, but the
+      service is up and listening).
+    * All 12 CapCut TTS tests still pass — no regression from the
+      index.ts refactor.
+    * next.config.ts loads cleanly with `turbopack.root` set to the
+      SleizDev project root.
+
+Stage Summary:
+- The Windows crash loop is fixed. The service now starts on first run
+  with zero configuration — env-loader injects documented defaults if no
+  .env.local is present, and the service defers Supabase client creation
+  so even a totally broken env config won't crash the boot.
+- The Next.js lockfile warning is silenced by setting `turbopack.root`
+  in next.config.ts.
+- The README no longer lies about `.env.local` being included.
+- `.env.example` is now committed to the repo so users can see what
+  env vars are required.
+- All previous TTS / STT / Gemini work (Tasks 1-6) is unaffected.

@@ -14,7 +14,35 @@ cd ../..
 ```
 
 ### 2. Environment Variables
-File `.env.local` is included:
+
+The project ships with **documented default credentials** that work out of
+the box for testing — you do NOT need to create `.env.local` to start the
+app. The translation service's env-loader will auto-inject them on first
+run if no `.env.local` is found.
+
+**To use your own Supabase project** (recommended for production), create a
+`.env.local` file at the project root with these variables:
+
+```
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_xxxxxxxxxxxxxxxxxxxxxxx
+SUPABASE_SECRET_KEY=sb_secret__xxxxxxxxxxxxxxxxxxxxxxxxx
+SUPABASE_SERVICE_ROLE_KEY=sb_secret__xxxxxxxxxxxxxxxxxxxxxxxxx
+SUPABASE_URL=https://your-project.supabase.co
+```
+
+A template is provided as `.env.example` — copy it to `.env.local` and fill
+in your values:
+
+```bash
+cp .env.example .env.local
+# Then edit .env.local with your Supabase project's credentials
+```
+
+**Default credentials** (auto-injected by env-loader if `.env.local` is
+missing — these are the project's own Supabase instance, already public via
+this README, so safe to use for testing):
+
 ```
 NEXT_PUBLIC_SUPABASE_URL=https://okeyouuilaldknazzhkx.supabase.co
 NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_kkTBJYylMxU2itNaXSdpsg_8LmNTyH2

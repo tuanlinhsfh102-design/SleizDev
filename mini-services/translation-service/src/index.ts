@@ -21,17 +21,54 @@ import { JobStatus } from './types.js';
 
 const PORT = 3004;
 
-// Supabase admin client (uses service role key)
+// Supabase admin client (uses service role key).
+//
+// Built lazily so the service can boot even when env vars are missing —
+// previously this would crash on import with `supabaseUrl is required.`,
+// leaving the service stuck in a restart loop. Now the service starts,
+// /health-check works, and only translation requests that actually need
+// Supabase will throw a clear actionable error.
+//
+// env-loader.ts injects documented defaults if .env.local is missing, so in
+// practice supabaseUrl/supabaseKey will almost always be set. The lazy
+// pattern is defense in depth.
 const supabaseUrl = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_SECRET_KEY;
 
+let supabase: ReturnType<typeof createSupabaseClient> | null = null;
+let supabaseInitError: string | null = null;
+
 if (!supabaseUrl || !supabaseKey) {
-  console.error('[FATAL] Missing Supabase credentials');
+  supabaseInitError =
+    'Missing Supabase credentials. Set SUPABASE_URL (or NEXT_PUBLIC_SUPABASE_URL) ' +
+    'and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY) in .env.local at ' +
+    'the SleizDev project root. See README-SETUP.md for the template.';
+  console.error(`[FATAL] ${supabaseInitError}`);
+  console.error('[FATAL] The service will start, but any translation request that');
+  console.error('[FATAL] needs Supabase will fail until env vars are configured.');
+} else {
+  try {
+    supabase = createSupabaseClient(supabaseUrl, supabaseKey, {
+      auth: { persistSession: false },
+    });
+    console.log('[supabase] Client initialized successfully');
+  } catch (err: any) {
+    supabaseInitError = `Supabase client init failed: ${err.message}`;
+    console.error(`[FATAL] ${supabaseInitError}`);
+  }
 }
 
-const supabase = createSupabaseClient(supabaseUrl!, supabaseKey!, {
-  auth: { persistSession: false },
-});
+/**
+ * Get the Supabase client, or throw a clear error if it's not configured.
+ * Use this inside request handlers so the error is actionable.
+ */
+function getSupabase() {
+  if (supabase) return supabase;
+  throw new Error(
+    supabaseInitError ||
+      'Supabase client not initialized. Check server logs for the FATAL message.'
+  );
+}
 
 // HTTP server (only for Socket.io handshake, no custom routes)
 const httpServer = createServer((req, res) => {
@@ -157,6 +194,12 @@ async function updateJobProgress(
   currentStep: string,
   socket?: Socket
 ) {
+  // Resolve the Supabase client lazily so the service can boot even when
+  // env vars are missing. If supabase is null (env not configured), the
+  // try/catch below swallows the error and just logs a warning — the
+  // socket.io emit still goes through so the frontend keeps getting progress.
+  const supabase = supabaseInitError ? null : getSupabase();
+
   const job = {
     id: jobId,
     movie_id: movieId,
@@ -167,6 +210,7 @@ async function updateJobProgress(
 
   // Update database
   try {
+    if (!supabase) throw new Error(supabaseInitError || 'supabase not configured');
     await supabase
       .from('translation_jobs')
       .update({
@@ -199,6 +243,7 @@ async function updateJobProgress(
  */
 async function fetchPreviousTranslations(movieId: string): Promise<string[]> {
   try {
+    const supabase = getSupabase();
     // First, look up which channel this movie belongs to.
     const { data: movie, error: movieErr } = await supabase
       .from('movies')
@@ -243,6 +288,11 @@ async function fetchPreviousTranslations(movieId: string): Promise<string[]> {
  */
 async function processTranslation(params: TranslationParams, socket?: Socket) {
   const { movieId, jobId, videoUrl, userId, apiKeys, ttsVoice, movieTitle, episode } = params;
+
+  // Resolve Supabase client up-front so we get a clear actionable error
+  // before doing any video download / audio extraction work. (If supabase
+  // is null, getSupabase() throws with the FATAL message from boot.)
+  const supabase = getSupabase();
 
   // Create temp working directory
   const workDir = path.join(os.tmpdir(), `translation-${movieId}-${nanoid(8)}`);
@@ -297,7 +347,7 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
       .eq('id', movieId);
 
     // Step 5: Generate TTS audio
-    await updateJobProgress(jobId, movieId, 'generating_tts', 60, 'Đang tạo âm thanh lồng tiếng (TikTok TTS)...', socket);
+    await updateJobProgress(jobId, movieId, 'generating_tts', 60, 'Đang tạo âm thanh lồng tiếng (CapCut TTS)...', socket);
     const fullAudioPath = await generateAudioFromSrt(
       vietnameseSrt,
       ttsVoice,
@@ -399,6 +449,7 @@ async function uploadToSupabase(
   bucket: string,
   fileName: string
 ): Promise<string> {
+  const supabase = getSupabase();
   const fullPath = `${userId}/${movieId}/${fileName}`;
   const fileBuffer = fs.readFileSync(filePath);
 
@@ -437,7 +488,11 @@ httpServer.listen(PORT, () => {
  * so we never silently restart ancient jobs the user has moved on from.
  */
 async function recoverPendingJobs() {
-  if (!supabaseUrl || !supabaseKey) return;
+  if (!supabaseUrl || !supabaseKey || supabaseInitError) {
+    console.log('[startup] Skipping job recovery — Supabase not configured');
+    return;
+  }
+  const supabase = getSupabase();
 
   const cutoff = new Date(Date.now() - 10 * 60 * 1000).toISOString();
   const { data: pendingJobs, error } = await supabase
