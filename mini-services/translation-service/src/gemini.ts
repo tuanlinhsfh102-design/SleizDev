@@ -1,6 +1,7 @@
 // Gemini API integration
-// Uses Gemini 2.5 Flash (with 2.0 Flash fallback) for SRT translation and
-// description generation.
+// Uses gemini-3.1-flash-lite-preview EXCLUSIVELY for SRT translation and
+// description generation. No fallback models, no env-overridable model
+// list — do not introduce either without explicit instruction.
 //
 // Translation strategy:
 //   - Each SRT is split into batches of BATCH_SIZE entries (default 100) to
@@ -11,19 +12,13 @@
 //   - Previous episode Vietnamese translations can be passed in as
 //     conversation history so character names / nicknames / titles stay
 //     consistent across episodes.
-//   - Model fallback: gemini-2.5-flash → gemini-2.0-flash. Newer models
-//     are sometimes geo-restricted ("User location is not supported"); the
-//     fallback gives the pipeline a second chance on older models.
 
 import { SrtEntry, parseSrt, formatSrt } from './srt-utils.js';
 
-// Models tried in order. Override the entire list with GEMINI_MODELS env
-// (comma-separated), or pin a single model with GEMINI_MODEL.
-const DEFAULT_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
-const GEMINI_MODELS = (process.env.GEMINI_MODEL
-  ? [process.env.GEMINI_MODEL]
-  : process.env.GEMINI_MODELS?.split(',').map((s) => s.trim()).filter(Boolean)
-) || DEFAULT_MODELS;
+// The ONLY Gemini model this service is allowed to call. Hardcoded on
+// purpose — do NOT make this configurable via env vars or fall back to
+// a different model on quota/geo errors.
+const GEMINI_MODEL = 'gemini-3.1-flash-lite-preview';
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
 /** Lines per Gemini request. Higher = fewer requests = less quota burn. */
@@ -197,13 +192,13 @@ ${segmentsJson}`;
 /**
  * Call Gemini API with a text prompt.
  *
- * Tries each model in GEMINI_MODELS in order:
- *   - 429 / 5xx: retry the SAME model with exponential backoff (up to 3x)
- *   - 400 "User location is not supported": skip to next model (geo block)
+ * Uses the single hardcoded model GEMINI_MODEL. Retry policy:
+ *   - 429 / 5xx: retry with exponential backoff (up to 3x)
  *   - other 4xx: throw immediately (bad request, won't fix by retrying)
- *   - network error: retry the same model with backoff
+ *   - network error: retry with backoff
  *
- * If all models fail, throws the most informative error found.
+ * The model is never swapped for a different one — geo/quota errors
+ * surface to the caller instead of silently falling back.
  */
 async function callGemini(
   apiKey: string,
@@ -211,7 +206,7 @@ async function callGemini(
   expectedSegmentCount: number
 ): Promise<string> {
   // Rough token budget: ~80 tokens per segment for Vietnamese output.
-  // Capped at 32768 (model max for 2.5-flash).
+  // Capped at 32768 (safe max output for gemini-3.1-flash-lite-preview).
   const maxOutputTokens = Math.min(
     32768,
     Math.max(4096, expectedSegmentCount * 80)
@@ -235,7 +230,7 @@ async function callGemini(
 
   const errors: string[] = [];
 
-  for (const model of GEMINI_MODELS) {
+  for (const model of [GEMINI_MODEL]) {
     const url = `${GEMINI_API_BASE}/models/${model}:generateContent?key=${apiKey}`;
     let lastError: Error | null = null;
 
@@ -250,21 +245,7 @@ async function callGemini(
         if (!response.ok) {
           const errorText = await response.text();
 
-          // Geo-restriction: this model is blocked in this region. Try
-          // the next model — no point retrying the same one.
-          if (
-            response.status === 400 &&
-            errorText.includes('User location is not supported')
-          ) {
-            errors.push(`${model}: geo-blocked (User location is not supported)`);
-            console.warn(
-              `[gemini] ${model} is geo-blocked in this region, trying next model...`
-            );
-            lastError = null; // not a retryable error for THIS model
-            break; // exit attempt loop, fall through to next model
-          }
-
-          // Rate limit or server error: retry same model with backoff
+          // Rate limit or server error: retry same model with backoff.
           if (
             (response.status === 429 || response.status >= 500) &&
             attempt < 2
@@ -280,20 +261,9 @@ async function callGemini(
             continue;
           }
 
-          // Quota exhausted on this key for this model — try the next
-          // model rather than retrying (different models have separate quotas).
-          if (response.status === 429) {
-            errors.push(
-              `${model}: quota exhausted (${errorText.substring(0, 150)})`
-            );
-            console.warn(
-              `[gemini] ${model} quota exhausted, trying next model...`
-            );
-            lastError = null;
-            break;
-          }
-
-          // Non-retryable client error (bad request, auth, etc.)
+          // Any other non-OK response (400 geo block, 401 auth, 403 forbidden,
+          // quota exhausted, etc.) is non-retryable here — we don't swap to
+          // a different model, so surface the error to the caller.
           throw new Error(
             `Gemini API error (${response.status}): ${errorText.substring(0, 300)}`
           );
@@ -315,9 +285,8 @@ async function callGemini(
 
         return text;
       } catch (err: any) {
-        // Network errors get retried; the "geo-blocked" break above is
-        // already handled. Anything else with a Gemini error message is
-        // a hard fail.
+        // Network errors get retried; any error with a "Gemini" prefix is
+        // a hard fail and is re-thrown immediately.
         if (err.message?.includes('Gemini')) {
           throw err;
         }
@@ -334,32 +303,14 @@ async function callGemini(
       }
     }
 
-    // If we got here with a real error, record it and try the next model.
     if (lastError) {
       errors.push(`${model}: ${lastError.message}`);
-      console.warn(`[gemini] ${model} failed: ${lastError.message}`);
     }
   }
 
-  // All models failed.
-  const geoBlocked = errors.some((e) => e.includes('geo-blocked'));
-  const allQuota = errors.every((e) => e.includes('quota') || e.includes('geo-blocked'));
-
-  if (geoBlocked && allQuota) {
-    throw new Error(
-      `All Gemini models failed.\n` +
-        errors.map((e) => `  - ${e}`).join('\n') +
-        `\n\nThis server's region is geo-blocked for newer Gemini models AND ` +
-        `quota is exhausted on older models. Either:\n` +
-        `  (a) Run this service from a supported region (Vietnam works), or\n` +
-        `  (b) Enable billing on the Google Cloud project tied to your API key ` +
-        `(paid tier has no geo restrictions), or\n` +
-        `  (c) Wait for the free-tier quota to reset (usually daily).`
-    );
-  }
-
   throw new Error(
-    `All Gemini models failed:\n` + errors.map((e) => `  - ${e}`).join('\n')
+    `Gemini (${GEMINI_MODEL}) failed after retries:\n` +
+      errors.map((e) => `  - ${e}`).join('\n')
   );
 }
 
@@ -533,25 +484,22 @@ QUAN TRỌNG:
 }
 
 /**
- * Test Gemini API key validity with a minimal request.
- * Tries each configured model until one succeeds.
+ * Test Gemini API key validity with a minimal request against the
+ * single configured model (gemini-3.1-flash-lite-preview).
  */
 export async function testGeminiApiKey(apiKey: string): Promise<boolean> {
-  for (const model of GEMINI_MODELS) {
-    try {
-      const url = `${GEMINI_API_BASE}/models/${model}:generateContent?key=${apiKey}`;
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: 'Hello' }] }],
-          generationConfig: { maxOutputTokens: 10 },
-        }),
-      });
-      if (response.ok) return true;
-    } catch {
-      // try next model
-    }
+  const url = `${GEMINI_API_BASE}/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: 'Hello' }] }],
+        generationConfig: { maxOutputTokens: 10 },
+      }),
+    });
+    return response.ok;
+  } catch {
+    return false;
   }
-  return false;
 }
