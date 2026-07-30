@@ -360,9 +360,14 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
     );
 
     // Step 6: Dub the video (replace original audio with Vietnamese TTS audio)
+    // originalVolume controls how loud the original Chinese audio is in the
+    // final mix (background ambience). Default 0.03 = 3% — just enough to
+    // hear music/sound effects but not drown out the Vietnamese TTS voice.
+    // Override via DUB_ORIGINAL_VOLUME env var (0.0 = mute original, 1.0 = full).
+    const originalVolume = parseFloat(process.env.DUB_ORIGINAL_VOLUME || '0.03');
     await updateJobProgress(jobId, movieId, 'dubbing', 78, 'Đang lồng tiếng vào video...', socket);
     const dubbedVideoPath = path.join(workDir, 'dubbed.mp4');
-    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, 0.1);
+    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, originalVolume);
 
     // Step 6.5: Burn Vietnamese subtitles into the video (chèn chữ vào video)
     // This renders the SRT text directly onto the video frames, so the

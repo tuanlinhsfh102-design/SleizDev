@@ -696,9 +696,9 @@ export async function dubVideo(
   videoPath: string,
   audioPath: string,
   outputPath: string,
-  originalVolume = 0.1 // Keep original audio at 10% volume as background
+  originalVolume = 0.03 // Keep original audio at 3% volume as background ambience
 ): Promise<void> {
-  console.log('[ffmpeg] Dubbing video with new audio + 16:9 auto-crop...');
+  console.log(`[ffmpeg] Dubbing video with new audio + 16:9 auto-crop (original volume: ${(originalVolume * 100).toFixed(0)}%)...`);
 
   // 1. Detect crop box
   const crop = await detectCrop(videoPath, 5);
