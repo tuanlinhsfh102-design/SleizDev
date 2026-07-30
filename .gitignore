@@ -69,3 +69,9 @@ server.log
 *.mkv
 *.avi
 *.webm
+
+# bun lockfile
+bun.lock
+
+# python bytecode
+*.pyc
