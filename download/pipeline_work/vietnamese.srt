@@ -1,0 +1,19 @@
+1
+00:00:00,120 --> 00:00:02,680
+Chào mừng mọi người đã đến với kênh của tôi
+
+2
+00:00:02,680 --> 00:00:05,920
+Hôm nay chúng ta sẽ cùng nói về sự phát triển của trí tuệ nhân tạo
+
+3
+00:00:05,920 --> 00:00:08,800
+Trí tuệ nhân tạo đã thay đổi cuộc sống của chúng ta
+
+4
+00:00:08,800 --> 00:00:11,640
+Từ điện thoại thông minh đến xe tự lái
+
+5
+00:00:11,640 --> 00:00:14,679
+Tương lai sẽ còn nhiều ứng dụng đáng kinh ngạc hơn nữa

@@ -1,0 +1,5 @@
+file '/home/z/my-project/download/pipeline_test/clips/clip_000.mp3'
+file '/home/z/my-project/download/pipeline_test/clips/clip_001.mp3'
+file '/home/z/my-project/download/pipeline_test/clips/clip_002.mp3'
+file '/home/z/my-project/download/pipeline_test/clips/clip_003.mp3'
+file '/home/z/my-project/download/pipeline_test/clips/clip_004.mp3'
