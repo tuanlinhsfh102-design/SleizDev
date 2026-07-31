@@ -370,44 +370,19 @@ export function TranslationStudio({
       if (updateError) throw updateError;
       videoUploaded = true;
 
-      const extractResponse = await fetch('/api/extract-srt', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          movieId,
-          movieTitle: movie?.title || movieTitle,
-          originalFileName: file.name,
-          videoUrl: urlData.publicUrl,
-        }),
-      });
-
-      const extractResult = await extractResponse.json();
-      if (!extractResponse.ok || !extractResult.success) {
-        throw new Error(extractResult.error || 'Tạo SRT thất bại');
-      }
-
-      const { error: srtUpdateError } = await supabase
-        .from('movies')
-        .update({ original_srt: extractResult.srt })
-        .eq('id', movieId);
-      if (srtUpdateError) throw srtUpdateError;
-
+      // Skip /api/extract-srt — pipeline does STT as Step 3 with progress
       fetchMovie();
-      setActiveTab('original-srt');
       const startResult = await startTranslationInternal({
         videoUrl: urlData.publicUrl,
         movieOverrides: {
           ...movie,
           video_url: urlData.publicUrl,
-          original_srt: extractResult.srt,
           status: 'translating',
         },
       });
       toast.success(
         startResult === 'accepted'
-          ? `Đã tải video, tạo SRT và tự động bắt đầu dịch`
+          ? `Đã tải video lên — tự động bắt đầu dịch`
           : 'Đã tải video, tạo SRT. Job dịch sẽ tự chạy khi server online'
       );
     } catch (error: any) {
@@ -487,48 +462,22 @@ export function TranslationStudio({
         .eq('id', movieId);
       if (updateError) throw updateError;
 
-      // Step 3: Trigger SRT extraction (same flow as file upload).
-      setTiktokImportStage('Đang nhận diện giọng nói thành SRT (CapCut API)...');
-      const extractResponse = await fetch('/api/extract-srt', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          movieId,
-          movieTitle: movie?.title || movieTitle,
-          originalFileName: importResult.filename || 'tiktok-video.mp4',
-          videoUrl: importResult.videoUrl,
-        }),
-      });
-
-      const extractResult = await extractResponse.json();
-      if (!extractResponse.ok || !extractResult.success) {
-        throw new Error(extractResult.error || 'Tạo SRT thất bại');
-      }
-
-      // Step 4: Save the extracted SRT to the movie record.
-      const { error: srtUpdateError } = await supabase
-        .from('movies')
-        .update({ original_srt: extractResult.srt })
-        .eq('id', movieId);
-      if (srtUpdateError) throw srtUpdateError;
-
+      // Skip /api/extract-srt — pipeline does STT as Step 3 with progress
       setTiktokUrl('');
+      setTiktokImportStage('Đã tải video. Đang tự động bắt đầu dịch phim...');
       fetchMovie();
-      setActiveTab('original-srt');
-      setTiktokImportStage('Đã tạo SRT. Đang tự động bắt đầu dịch phim...');
       const startResult = await startTranslationInternal({
         videoUrl: importResult.videoUrl,
         movieOverrides: {
           ...movie,
           video_url: importResult.videoUrl,
-          original_srt: extractResult.srt,
           status: 'translating',
         },
       });
       toast.success(
         startResult === 'accepted'
           ? `Đã tải video TikTok và tự động bắt đầu dịch${importResult.title ? `: "${importResult.title.slice(0, 50)}"` : ''}`
-          : 'Đã tải video TikTok, tạo SRT. Job dịch sẽ tự chạy khi server online'
+          : 'Đã tải video TikTok. Job dịch sẽ tự chạy khi server online'
       );
     } catch (error: any) {
       const msg = error.message || 'Lỗi không xác định';
