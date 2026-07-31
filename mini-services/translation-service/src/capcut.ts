@@ -17,14 +17,44 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { exec } from 'child_process';
-import { spawn } from 'child_process';
+import { exec, spawn } from 'child_process';
+
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
 
 const execAsync = promisify(exec);
 
 const FFMPEG_PATH = ffmpegStatic as unknown as string;
+
+/**
+ * Run an ffmpeg command safely on all platforms (Windows, macOS, Linux).
+ * Uses spawn() with shell:false to avoid Windows cmd.exe quoting issues.
+ */
+function runFfmpeg(args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(FFMPEG_PATH, args, {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+      shell: false,
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf-8'); });
+    proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf-8'); });
+    proc.on('error', (err) => {
+      reject(new Error(`Failed to spawn ffmpeg (${FFMPEG_PATH}): ${err.message}`));
+    });
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+      } else {
+        reject(new Error(`ffmpeg exited with code ${code}\n` +
+          `ffmpeg path: ${FFMPEG_PATH}\n` +
+          `stderr tail: ${stderr.split('\n').slice(-5).join(' | ')}`));
+      }
+    });
+  });
+}
 
 // Resolve the Python bridge script and vendored library locations relative to
 // this source file so the integration works whether the project is run via
