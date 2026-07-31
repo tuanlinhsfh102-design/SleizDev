@@ -312,12 +312,140 @@ export async function generateAudioFromSrt(
 
   onProgress?.(entries.length, entries.length);
 
-  console.log('[tts] Merging audio clips with proper timing...');
+  // -----------------------------------------------------------------------
+  // PHASE 3: Measure actual TTS clip durations + retime SRT to match.
+  //
+  // CRITICAL FIX for "giọng nói chưa nói xong đã chuyển":
+  //   CapCut TTS generates audio at natural speech rate. The SRT slot
+  //   duration (from CapCut STT) may be SHORTER than the TTS audio.
+  //   Previously, atrim=0:${trimSec} would cut the TTS audio short,
+  //   causing mid-sentence cutoffs.
+  //
+  //   Fix: measure each clip's actual duration, then retime the SRT so
+  //   each entry's endMs = startMs + clipDuration. If a clip is longer
+  //   than the original slot, we push subsequent entries back to make
+  //   room. The retimed SRT is returned so burnSubtitlesIntoVideo uses
+  //   the same timing — keeping audio and subtitles in sync.
+  // -----------------------------------------------------------------------
+  console.log('[tts] Phase 3: Measuring actual TTS clip durations + retiming SRT...');
+  const retimedEntries: Array<SrtEntry & { startMs: number; endMs: number }> = [];
+  let currentPosMs = entries[0]?.startMs || 0;
+
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    const clipPath = clipPaths[i];
+
+    // Measure actual clip duration
+    let clipDurationMs: number;
+    if (fs.existsSync(clipPath) && fs.statSync(clipPath).size > 100) {
+      clipDurationMs = await getAudioDurationMs(clipPath);
+    } else {
+      // Failed slot — use original slot duration as fallback
+      clipDurationMs = Math.max(200, entry.endMs - entry.startMs);
+    }
+
+    // If this is the first entry, keep its original start time.
+    // For subsequent entries, ensure we don't start before the previous
+    // entry ends (avoid overlap).
+    const startMs = i === 0 ? entry.startMs : Math.max(entry.startMs, currentPosMs);
+    const endMs = startMs + clipDurationMs;
+
+    retimedEntries.push({
+      ...entry,
+      startMs,
+      endMs,
+      // Update the SRT time strings to match the retimed values
+      start: msToSrtTimeString(startMs),
+      end: msToSrtTimeString(endMs),
+    });
+
+    currentPosMs = endMs;
+
+    if (i < 5 || i === entries.length - 1) {
+      const origDur = entry.endMs - entry.startMs;
+      const diff = clipDurationMs - origDur;
+      const sign = diff >= 0 ? '+' : '';
+      console.log(
+        `[tts]   clip ${i}: orig=${origDur}ms, actual=${clipDurationMs}ms (${sign}${diff}ms) -> ${startMs}-${endMs}ms`
+      );
+    }
+  }
+
+  // Write the retimed SRT for burnSubtitlesIntoVideo to use
+  const retimedSrtPath = path.join(outputDir, 'vietnamese_retimed.srt');
+  const retimedSrtContent = formatSrtFromEntries(retimedEntries);
+  fs.writeFileSync(retimedSrtPath, retimedSrtContent, 'utf-8');
+  console.log(`[tts] Retimed SRT written: ${retimedSrtPath}`);
+
+  // Log retime summary
+  const totalRetimeShift = currentPosMs - (entries[entries.length - 1]?.endMs || 0);
+  if (totalRetimeShift > 0) {
+    console.log(
+      `[tts] Retime summary: TTS audio extends ${totalRetimeShift}ms beyond original SRT end. ` +
+        `Subtitles have been stretched to match.`
+    );
+  }
+
+  console.log('[tts] Merging audio clips with retimed durations...');
   const outputPath = path.join(outputDir, 'full_audio.mp3');
 
-  await mergeClipsWithTiming(entries, clipPaths, outputPath, totalDurationMs);
+  // Use retimed entries for merge (no atrim cap — let TTS play to completion)
+  await mergeClipsWithTiming(retimedEntries, clipPaths, outputPath, totalDurationMs);
 
   return outputPath;
+}
+
+/**
+ * Format SRT entries back to SRT string.
+ */
+function formatSrtFromEntries(entries: Array<SrtEntry & { startMs: number; endMs: number }>): string {
+  return entries.map((e, i) => {
+    return `${i + 1}\n${e.start} --> ${e.end}\n${e.text}`;
+  }).join('\n\n') + '\n';
+}
+
+/**
+ * Convert milliseconds to SRT time string "HH:MM:SS,mmm".
+ */
+function msToSrtTimeString(ms: number): string {
+  if (ms < 0) ms = 0;
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  const mss = ms % 1000;
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')},${String(mss).padStart(3, '0')}`;
+}
+
+/**
+ * Get audio duration in milliseconds via ffmpeg probe.
+ * Uses ffmpeg -i parsing (same pattern as getAudioDurationSec but returns ms).
+ *
+ * NOTE: ffmpeg exits with code 1 when run without an output file, so
+ * execAsync throws. We capture the output from the error object.
+ */
+async function getAudioDurationMs(audioPath: string): Promise<number> {
+  try {
+    const cmd = `"${FFMPEG_PATH}" -i "${audioPath}" 2>&1`;
+    let output = '';
+    try {
+      const result = await execAsync(cmd, { maxBuffer: 1024 * 1024 });
+      output = result.stdout + '\n' + result.stderr;
+    } catch (err: any) {
+      // ffmpeg exits with code 1 when no output file is specified, but
+      // the stderr/stdout still contains the Duration: line we need.
+      output = (err.stdout || '') + '\n' + (err.stderr || '');
+    }
+    const match = output.match(/Duration:\s*(\d{2}):(\d{2}):(\d{2}\.\d+)/);
+    if (match) {
+      const [, h, m, s] = match;
+      return Math.round(
+        parseInt(h) * 3600000 + parseInt(m) * 60000 + parseFloat(s) * 1000
+      );
+    }
+  } catch {
+    // ignore
+  }
+  return 1000; // fallback: 1 second
 }
 
 /**
@@ -402,25 +530,19 @@ async function mergeClipsWithTiming(
 
   for (let i = 0; i < clipPaths.length; i++) {
     const startMs = Math.max(0, entries[i].startMs);
-    const endMs = Math.max(startMs + 100, entries[i].endMs);
-    // Trim duration in seconds — cap each clip to its SRT slot.
-    const trimSec = Math.max(0.1, (endMs - startMs) / 1000);
     // Delay in ms — pad with silence before the clip starts.
     const delayMs = startMs;
 
-    // Filter chain for this clip:
+    // Filter chain for this clip (NO atrim — let TTS play to completion):
     //   [i:a] -> aresample=44100 (normalize sample rate) ->
-    //   atrim=0:${trimSec} (cap length to SRT slot) ->
-    //   asetpts=PTS-STARTPTS (reset timestamps after trim) ->
+    //   asetpts=PTS-STARTPTS (reset timestamps) ->
     //   adelay=all=1:delays=${delayMs} (pad silence before clip) ->
     //   [a${i}]
     //
-    // ffmpeg 7.x adelay syntax: use 'delays=' keyword + 'all=1' to apply
-    // the same delay to every channel. The older positional 'adelay=N|N'
-    // form was deprecated and now triggers
-    //   "Unable to parse option value 'N' as boolean"
+    // The SRT has already been retimed in Phase 3 so each clip's natural
+    // duration fits within its slot. No need to cap with atrim.
     filterParts.push(
-      `[${i}:a]aresample=44100,atrim=0:${trimSec.toFixed(3)},asetpts=PTS-STARTPTS,adelay=all=1:delays=${delayMs}[a${i}]`
+      `[${i}:a]aresample=44100,asetpts=PTS-STARTPTS,adelay=all=1:delays=${delayMs}[a${i}]`
     );
   }
 

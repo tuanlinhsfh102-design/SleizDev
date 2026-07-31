@@ -415,9 +415,19 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
     // subtitles are visible in any video player. The dubbed video from
     // step 6 is the input; the output is a new video with both the
     // Vietnamese TTS audio AND burned-in Vietnamese subtitles.
+    //
+    // CRITICAL: Use the RETIMED SRT (vietnamese_retimed.srt) if it exists,
+    // not the original vietnamese.srt. The retimed SRT matches the actual
+    // TTS audio durations, so subtitles stay in sync with the audio. Using
+    // the original SRT would cause subtitles to appear/disappear at the
+    // wrong times (before the TTS voice finishes speaking).
     await updateJobProgress(jobId, movieId, 'dubbing', 84, 'Đang chèn phụ đề tiếng Việt vào video...', socket);
-    const srtPath = path.join(workDir, 'vietnamese.srt');
-    fs.writeFileSync(srtPath, vietnameseSrt, 'utf-8');
+    const retimedSrtPath = path.join(workDir, 'vietnamese_retimed.srt');
+    const srtPath = fs.existsSync(retimedSrtPath) ? retimedSrtPath : path.join(workDir, 'vietnamese.srt');
+    if (!fs.existsSync(srtPath)) {
+      fs.writeFileSync(srtPath, vietnameseSrt, 'utf-8');
+    }
+    console.log(`[pipeline] Using SRT for subtitle burn: ${path.basename(srtPath)}`);
     const finalVideoPath = path.join(workDir, 'final.mp4');
     try {
       await burnSubtitlesIntoVideo(dubbedVideoPath, srtPath, finalVideoPath);
