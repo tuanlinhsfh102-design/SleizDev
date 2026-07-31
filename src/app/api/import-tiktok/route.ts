@@ -53,6 +53,156 @@ interface DownloadResult {
   filename: string;
 }
 
+function extractTikTokVideoId(url: string): string | null {
+  const match = url.match(/\/video\/(\d+)/i);
+  return match?.[1] || null;
+}
+
+function pickFirstVideoUrl(value: unknown): string | null {
+  if (!value) return null;
+
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const picked = pickFirstVideoUrl(entry);
+      if (picked) return picked;
+    }
+    return null;
+  }
+
+  if (typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    return (
+      pickFirstVideoUrl(record.url) ||
+      pickFirstVideoUrl(record.src) ||
+      pickFirstVideoUrl(record.playAddr) ||
+      pickFirstVideoUrl(record.play_addr) ||
+      pickFirstVideoUrl(record.downloadAddr) ||
+      pickFirstVideoUrl(record.download_addr) ||
+      pickFirstVideoUrl(record.urls)
+    );
+  }
+
+  return null;
+}
+
+async function extractFromEmbedPage(url: string): Promise<{ videoUrl: string; title: string }> {
+  const videoId = extractTikTokVideoId(url);
+  if (!videoId) {
+    throw new Error('Could not determine TikTok video ID from URL');
+  }
+
+  const embedUrl = `https://www.tiktok.com/embed/v2/${videoId}`;
+  const resp = await fetch(embedUrl, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept':
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.tiktok.com/',
+    },
+    redirect: 'follow',
+  });
+
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch TikTok embed page: HTTP ${resp.status}`);
+  }
+
+  const html = await resp.text();
+  const frontityStateMatch = html.match(
+    /<script id="__FRONTITY_CONNECT_STATE__" type="application\/json">([\s\S]*?)<\/script>/
+  );
+  if (!frontityStateMatch) {
+    throw new Error('TikTok embed page did not include __FRONTITY_CONNECT_STATE__');
+  }
+
+  const frontityState = JSON.parse(frontityStateMatch[1]);
+  const routeState =
+    frontityState?.source?.data?.[`/embed/v2/${videoId}`] ||
+    frontityState?.source?.data?.[`/embed/v2/${videoId}/`];
+  const itemInfos = routeState?.videoData?.itemInfos;
+  const videoInfo = itemInfos?.video;
+  const videoUrl =
+    pickFirstVideoUrl(videoInfo?.urls) ||
+    pickFirstVideoUrl(videoInfo?.playAddr) ||
+    pickFirstVideoUrl(videoInfo?.downloadAddr) ||
+    pickFirstVideoUrl(videoInfo?.url);
+
+  if (!videoUrl) {
+    throw new Error('TikTok embed page did not expose a playable video URL');
+  }
+
+  const title =
+    (typeof itemInfos?.text === 'string' && itemInfos.text.trim()) ||
+    (typeof routeState?.videoData?.shareMeta?.title === 'string' &&
+      routeState.videoData.shareMeta.title.trim()) ||
+    'TikTok Video';
+
+  console.log(`[import-tiktok] Found video URL via embed page`);
+  return { videoUrl, title: title.slice(0, 100) };
+}
+
+async function downloadVideoInChunks(
+  url: string,
+  outputFile: string,
+  headers: Record<string, string>,
+  chunkSize = 2 * 1024 * 1024
+): Promise<number> {
+  fs.writeFileSync(outputFile, Buffer.alloc(0));
+
+  let start = 0;
+  let totalSize: number | null = null;
+
+  for (let attempt = 0; attempt < 512; attempt += 1) {
+    const end = start + chunkSize - 1;
+    const resp = await fetch(url, {
+      headers: {
+        ...headers,
+        Range: `bytes=${start}-${end}`,
+      },
+    });
+
+    if (resp.status !== 206 && resp.status !== 200) {
+      throw new Error(
+        `Failed to download video from TikTok CDN: HTTP ${resp.status} ${resp.statusText}`
+      );
+    }
+
+    const buffer = Buffer.from(await resp.arrayBuffer());
+    if (!buffer.length) {
+      throw new Error('TikTok CDN returned an empty chunk');
+    }
+
+    fs.appendFileSync(outputFile, buffer);
+
+    const contentRange = resp.headers.get('content-range');
+    if (contentRange) {
+      const match = contentRange.match(/bytes\s+(\d+)-(\d+)\/(\d+|\*)/i);
+      if (match) {
+        const chunkEnd = Number(match[2]);
+        totalSize = match[3] === '*' ? null : Number(match[3]);
+        if (totalSize !== null && chunkEnd + 1 >= totalSize) {
+          return fs.statSync(outputFile).size;
+        }
+        start = chunkEnd + 1;
+        continue;
+      }
+    }
+
+    if (resp.status === 200 || buffer.length < chunkSize) {
+      return fs.statSync(outputFile).size;
+    }
+
+    start += buffer.length;
+  }
+
+  throw new Error('TikTok CDN download exceeded the maximum number of chunks');
+}
+
 /**
  * Resolve a TikTok short URL (vt.tiktok.com/xxx) to its final destination.
  * TikTok sometimes redirects to /hk/about when it detects a bot — we throw
@@ -224,6 +374,7 @@ async function downloadWithScraper(url: string, outputDir: string): Promise<Down
   // TikTok sometimes redirects to /about when it detects a bot — we detect
   // that and throw a clear error.
   const fullUrl = await resolveShortUrl(url);
+  const videoId = extractTikTokVideoId(fullUrl) || 'video';
 
   // Fetch the TikTok page HTML with browser-like headers
   const headers: Record<string, string> = {
@@ -241,163 +392,134 @@ async function downloadWithScraper(url: string, outputDir: string): Promise<Down
     'Upgrade-Insecure-Requests': '1',
   };
 
-  const pageResp = await fetch(fullUrl, { headers, redirect: 'follow' });
-  if (!pageResp.ok) {
-    throw new Error(`Failed to fetch TikTok page: HTTP ${pageResp.status}`);
-  }
-  const html = await pageResp.text();
-  console.log(
-    `[import-tiktok] Page HTML size: ${html.length} bytes, final URL: ${pageResp.url}`
-  );
-
-  // Detect anti-bot responses BEFORE trying to extract video URL — gives
-  // the user a clear, actionable error instead of a generic "could not
-  // extract video URL".
-  const htmlLower = html.toLowerCase();
-  if (pageResp.url.includes('/about') || pageResp.url.includes('/share/')) {
-    throw new Error(
-      `TikTok redirected to "${pageResp.url}" — this server's IP is blocked by TikTok ` +
-        'or the video is geo-restricted. Run the app on a residential connection, ' +
-        'or install yt-dlp (which handles bot detection better).'
-    );
-  }
-  if (htmlLower.includes('captcha') || htmlLower.includes('verify you are human')) {
-    throw new Error(
-      'TikTok returned a CAPTCHA page. This server has been flagged for automated ' +
-        'requests. Try again later, use a different network, or install yt-dlp ' +
-        '(which can sometimes bypass CAPTCHAs with cookies).'
-    );
-  }
-  if (htmlLower.includes('login') && htmlLower.includes('sign in to')) {
-    throw new Error(
-      'TikTok returned a login wall — this video is private or age-restricted. ' +
-        'Private videos cannot be downloaded without authentication.'
-    );
-  }
-
-  // Extract video URL from __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON blob.
-  // TikTok embeds all video data in a script tag like:
-  //   <script id="__UNIVERSAL_DATA_FOR_REHYDRATION__" type="application/json">{...}</script>
-  const universalDataMatch = html.match(
-    /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/
-  );
   let videoUrl: string | null = null;
   let title = 'TikTok Video';
+  let pageFailureReason: string | null = null;
 
-  if (universalDataMatch) {
-    try {
-      const data = JSON.parse(universalDataMatch[1]);
-      // Navigate the nested structure: webapp.video-detail.itemInfo.itemStruct
-      // Try multiple paths because TikTok's structure varies by region/version.
-      const itemStruct =
-        data?.webapp?.['video-detail']?.itemInfo?.itemStruct ||
-        data?.webapp?.['video-detail']?.itemStruct ||
-        data?.webapp?.['video-detail']?.itemData?.itemInfo?.itemStruct;
-      if (itemStruct) {
-        const video = itemStruct.video || {};
-        // playAddr is usually an array of URLs with different quality.
-        // Try multiple field names (camelCase + snake_case) for robustness.
-        const playAddr =
-          video.playAddr || video.play_addr || video.downloadAddr || video.download_addr;
-        if (Array.isArray(playAddr) && playAddr.length > 0) {
-          // Pick the highest-quality URL (usually the first one, but check
-          // for a url/src field on each entry).
-          for (const entry of playAddr) {
-            if (typeof entry === 'string') {
-              videoUrl = entry;
-              break;
+  try {
+    const pageResp = await fetch(fullUrl, { headers, redirect: 'follow' });
+    if (!pageResp.ok) {
+      pageFailureReason = `Failed to fetch TikTok page: HTTP ${pageResp.status}`;
+    } else {
+      const html = await pageResp.text();
+      console.log(
+        `[import-tiktok] Page HTML size: ${html.length} bytes, final URL: ${pageResp.url}`
+      );
+
+      // Detect anti-bot responses BEFORE trying to extract video URL.
+      const htmlLower = html.toLowerCase();
+      if (pageResp.url.includes('/about') || pageResp.url.includes('/share/')) {
+        pageFailureReason =
+          `TikTok redirected to "${pageResp.url}" — this server's IP is blocked by TikTok ` +
+          'or the video is geo-restricted. Run the app on a residential connection, ' +
+          'or install yt-dlp (which handles bot detection better).';
+      } else if (htmlLower.includes('captcha') || htmlLower.includes('verify you are human')) {
+        pageFailureReason =
+          'TikTok returned a CAPTCHA page. This server has been flagged for automated ' +
+          'requests. Try again later, use a different network, or install yt-dlp ' +
+          '(which can sometimes bypass CAPTCHAs with cookies).';
+      } else if (htmlLower.includes('login') && htmlLower.includes('sign in to')) {
+        pageFailureReason =
+          'TikTok returned a login wall — this video is private or age-restricted. ' +
+          'Private videos cannot be downloaded without authentication.';
+      } else {
+        // Extract video URL from __UNIVERSAL_DATA_FOR_REHYDRATION__ JSON blob.
+        const universalDataMatch = html.match(
+          /<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/
+        );
+
+        if (universalDataMatch) {
+          try {
+            const data = JSON.parse(universalDataMatch[1]);
+            const itemStruct =
+              data?.webapp?.['video-detail']?.itemInfo?.itemStruct ||
+              data?.webapp?.['video-detail']?.itemStruct ||
+              data?.webapp?.['video-detail']?.itemData?.itemInfo?.itemStruct;
+            if (itemStruct) {
+              videoUrl =
+                pickFirstVideoUrl(itemStruct.video?.playAddr) ||
+                pickFirstVideoUrl(itemStruct.video?.play_addr) ||
+                pickFirstVideoUrl(itemStruct.video?.downloadAddr) ||
+                pickFirstVideoUrl(itemStruct.video?.download_addr) ||
+                pickFirstVideoUrl(itemStruct.video?.url);
+              if (itemStruct.desc) title = String(itemStruct.desc).slice(0, 100);
             }
-            if (entry?.url) {
-              videoUrl = entry.url;
-              break;
-            }
-            if (entry?.src) {
-              videoUrl = entry.src;
+          } catch (err) {
+            console.warn(`[import-tiktok] Failed to parse __UNIVERSAL_DATA__: ${err}`);
+          }
+        }
+
+        // Fallback 1: look for og:video meta tags (multiple property names)
+        if (!videoUrl) {
+          const ogPatterns = [
+            /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/,
+            /<meta[^>]+property=["']og:video:secure_url["'][^>]+content=["']([^"']+)["']/,
+            /<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/,
+            /<meta[^>]+name=["']og:video:url["'][^>]+content=["']([^"']+)["']/,
+            /<meta[^>]+name=["']og:video["'][^>]+content=["']([^"']+)["']/,
+          ];
+          for (const pattern of ogPatterns) {
+            const match = html.match(pattern);
+            if (match) {
+              videoUrl = match[1].replace(/&amp;/g, '&');
+              console.log(`[import-tiktok] Found video URL via og:video meta tag`);
               break;
             }
           }
-        } else if (typeof playAddr === 'string') {
-          videoUrl = playAddr;
         }
-        if (itemStruct.desc) title = String(itemStruct.desc).slice(0, 100);
-        // Some videos store the URL directly on the video object
-        if (!videoUrl && video.url) videoUrl = String(video.url);
-      }
-    } catch (err) {
-      console.warn(`[import-tiktok] Failed to parse __UNIVERSAL_DATA__: ${err}`);
-    }
-  }
 
-  // Fallback 1: look for og:video meta tags (multiple property names)
-  if (!videoUrl) {
-    const ogPatterns = [
-      /<meta[^>]+property=["']og:video:url["'][^>]+content=["']([^"']+)["']/,
-      /<meta[^>]+property=["']og:video:secure_url["'][^>]+content=["']([^"']+)["']/,
-      /<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/,
-      /<meta[^>]+name=["']og:video:url["'][^>]+content=["']([^"']+)["']/,
-      /<meta[^>]+name=["']og:video["'][^>]+content=["']([^"']+)["']/,
-    ];
-    for (const pattern of ogPatterns) {
-      const match = html.match(pattern);
-      if (match) {
-        videoUrl = match[1].replace(/&amp;/g, '&');
-        console.log(`[import-tiktok] Found video URL via og:video meta tag`);
-        break;
+        // Fallback 2: look for a direct video URL in the page source.
+        if (!videoUrl) {
+          const videoTagMatch = html.match(/<video[^>]+src=["']([^"']+)["']/);
+          if (videoTagMatch) {
+            videoUrl = videoTagMatch[1].replace(/&amp;/g, '&');
+            console.log(`[import-tiktok] Found video URL via <video> tag`);
+          }
+        }
+
+        if (!videoUrl) {
+          pageFailureReason =
+            'Could not extract video URL from TikTok page. The page no longer exposes ' +
+            'the old rehydration payload on this network.';
+        }
       }
     }
+  } catch (pageErr: any) {
+    pageFailureReason = pageErr?.message || String(pageErr);
   }
 
-  // Fallback 2: look for a direct video URL in the page source (TikTok
-  // sometimes embeds the CDN URL in a <video> tag or a JSON-LD script)
   if (!videoUrl) {
-    const videoTagMatch = html.match(/<video[^>]+src=["']([^"']+)["']/);
-    if (videoTagMatch) {
-      videoUrl = videoTagMatch[1].replace(/&amp;/g, '&');
-      console.log(`[import-tiktok] Found video URL via <video> tag`);
+    try {
+      const embedResult = await extractFromEmbedPage(fullUrl);
+      videoUrl = embedResult.videoUrl;
+      title = embedResult.title || title;
+    } catch (embedErr: any) {
+      const embedMsg = embedErr?.message || String(embedErr);
+      throw new Error(
+        `Could not extract video URL from TikTok.\n` +
+          `  page scraper: ${pageFailureReason || 'unknown error'}\n` +
+          `  embed scraper: ${embedMsg}`
+      );
     }
-  }
-
-  if (!videoUrl) {
-    throw new Error(
-      'Could not extract video URL from TikTok page. The video may be private/deleted, ' +
-        'or TikTok has changed their page structure. ' +
-        'Install yt-dlp (`pip install yt-dlp`) for better compatibility — it handles ' +
-        'bot detection and page structure changes automatically.'
-    );
   }
 
   console.log(`[import-tiktok] Extracted video URL: ${videoUrl.slice(0, 80)}...`);
 
-  // Download the MP4 with proper Referer header (TikTok CDN requires it).
-  // Use Range: bytes=0- to request the full file (some CDNs return 416
-  // without a Range header).
-  const videoResp = await fetch(videoUrl, {
-    headers: {
-      'User-Agent': headers['User-Agent'],
-      'Referer': 'https://www.tiktok.com/',
-      'Accept': '*/*',
-      'Range': 'bytes=0-',
-    },
+  const outputFile = path.join(outputDir, 'video.mp4');
+  const downloadedBytes = await downloadVideoInChunks(videoUrl, outputFile, {
+    'User-Agent': headers['User-Agent'],
+    'Referer': 'https://www.tiktok.com/embed/v2/' + videoId,
+    'Accept': '*/*',
   });
 
-  if (!videoResp.ok) {
+  if (downloadedBytes < 1000) {
     throw new Error(
-      `Failed to download video from TikTok CDN: HTTP ${videoResp.status} ${videoResp.statusText}`
+      `Downloaded video is too small (${downloadedBytes} bytes) — likely an error page, not the actual video.`
     );
   }
 
-  const buffer = Buffer.from(await videoResp.arrayBuffer());
-  if (buffer.length < 1000) {
-    throw new Error(
-      `Downloaded video is too small (${buffer.length} bytes) — likely an error page, not the actual video.`
-    );
-  }
-
-  const outputFile = path.join(outputDir, 'video.mp4');
-  fs.writeFileSync(outputFile, buffer);
-
-  console.log(`[import-tiktok] Scraper success: ${buffer.length} bytes, title="${title}"`);
-  return { filePath: outputFile, title, filename: 'video.mp4' };
+  console.log(`[import-tiktok] Scraper success: ${downloadedBytes} bytes, title="${title}"`);
+  return { filePath: outputFile, title, filename: `tiktok-${videoId}.mp4` };
 }
 
 /**

@@ -210,7 +210,10 @@ function BreadcrumbTrail() {
     crumbs.push({ label: view.channelName });
   } else if (view.type === 'movie-detail') {
     crumbs.push({ label: 'Kênh', onClick: () => setView({ type: 'channels' }) });
-    crumbs.push({ label: 'Bộ phim', onClick: () => setView({ type: 'channel-detail', channelId: view.channelId, channelName: 'Bộ phim' }) });
+    crumbs.push({
+      label: view.channelName,
+      onClick: () => setView({ type: 'channel-detail', channelId: view.channelId, channelName: view.channelName }),
+    });
     crumbs.push({ label: view.movieTitle });
   } else if (view.type === 'api-keys') {
     crumbs.push({ label: 'API Keys' });

@@ -24,36 +24,151 @@ import {
   Wand2,
   Copy,
   Link as LinkIcon,
+  Pencil,
 } from 'lucide-react';
 import { Movie, TranslationJob, JOB_STATUS_LABELS } from '@/types';
 import { toast } from 'sonner';
 import { io, Socket } from 'socket.io-client';
+import { MovieEditorDialog } from '@/components/movies/MovieEditorDialog';
+import { useAppStore } from '@/lib/store';
 
 interface TranslationStudioProps {
   movieId: string;
   movieTitle: string;
   channelId: string;
+  channelName: string;
 }
 
-export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProps) {
+interface StartTranslationOptions {
+  videoUrl?: string | null;
+  movieOverrides?: Partial<Movie> | null;
+}
+
+export function TranslationStudio({
+  movieId,
+  movieTitle,
+  channelId,
+  channelName,
+}: TranslationStudioProps) {
   const supabase = createClient();
+  const setView = useAppStore((s) => s.setView);
   const [movie, setMovie] = useState<Movie | null>(null);
   const [job, setJob] = useState<TranslationJob | null>(null);
   const [loading, setLoading] = useState(true);
   const [videoUploading, setVideoUploading] = useState(false);
-  const [videoFile, setVideoFile] = useState<File | null>(null);
   const [tiktokUrl, setTiktokUrl] = useState('');
   const [tiktokImporting, setTiktokImporting] = useState(false);
   const [tiktokImportStage, setTiktokImportStage] = useState('');
-  const [activeTab, setActiveTab] = useState('upload');
+  const [activeTab, setActiveTab] = useState('info');
   const [editedVietnameseSrt, setEditedVietnameseSrt] = useState('');
   const [editedDescription, setEditedDescription] = useState('');
   const [processing, setProcessing] = useState(false);
+  const [editorOpen, setEditorOpen] = useState(false);
   const [apiKeys, setApiKeys] = useState<{ gemini?: string; capcut?: string; tiktok?: string }>({});
   const socketRef = useRef<Socket | null>(null);
   // Queue a start-translation payload so it can be re-emitted on reconnect
   // when the service is down at the moment the user clicks Start.
   const pendingStartRef = useRef<any>(null);
+
+  const buildMediaUrl = useCallback((url: string | null | undefined, version?: string | null) => {
+    if (!url) return '';
+
+    try {
+      const nextUrl = new URL(url);
+      if (version) {
+        nextUrl.searchParams.set('v', version);
+      }
+      return nextUrl.toString();
+    } catch {
+      if (!version) return url;
+      const separator = url.includes('?') ? '&' : '?';
+      return `${url}${separator}v=${encodeURIComponent(version)}`;
+    }
+  }, []);
+
+  const startTranslationInternal = useCallback(
+    async (options?: StartTranslationOptions): Promise<'accepted' | 'queued'> => {
+      const effectiveMovie = {
+        ...(movie || {}),
+        ...(options?.movieOverrides || {}),
+      } as Partial<Movie>;
+      const resolvedVideoUrl =
+        options?.videoUrl || options?.movieOverrides?.video_url || effectiveMovie.video_url || null;
+
+      if (!resolvedVideoUrl) {
+        throw new Error('Vui lòng tải lên video trước');
+      }
+      if (!apiKeys.gemini) {
+        throw new Error('Vui lòng thêm Gemini API key trong tab API Keys');
+      }
+
+      setProcessing(true);
+
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) throw new Error('Chưa đăng nhập');
+
+        const { data: jobData, error: jobError } = await supabase
+          .from('translation_jobs')
+          .insert({
+            movie_id: movieId,
+            user_id: user.id,
+            status: 'pending',
+            progress: 0,
+            current_step: 'Đang khởi tạo',
+          })
+          .select()
+          .single();
+        if (jobError) throw jobError;
+
+        setJob(jobData);
+
+        await supabase
+          .from('movies')
+          .update({ status: 'translating' })
+          .eq('id', movieId);
+
+        const startPayload = {
+          movieId,
+          jobId: jobData.id,
+          videoUrl: resolvedVideoUrl,
+          userId: user.id,
+          apiKeys,
+          ttsVoice: effectiveMovie.tts_voice || 'vi_vn_1',
+          ttsRate: effectiveMovie.tts_rate || '1.0',
+          ttsVolume: effectiveMovie.tts_volume ?? 1.0,
+          bgmVolume: effectiveMovie.bgm_volume ?? 0.03,
+          logoUrl: effectiveMovie.logo_url || null,
+          movieTitle: effectiveMovie.title || movieTitle,
+          episode: effectiveMovie.episode || '',
+          channelName,
+        };
+
+        if (socketRef.current && socketRef.current.connected) {
+          await new Promise<void>((resolve, reject) => {
+            socketRef.current?.emit('start-translation', startPayload, (response: any) => {
+              if (response?.status === 'accepted') {
+                resolve();
+              } else {
+                reject(new Error(response?.error || 'Không thể bắt đầu dịch'));
+              }
+            });
+          });
+          return 'accepted';
+        }
+
+        pendingStartRef.current = startPayload;
+        if (socketRef.current) {
+          socketRef.current.connect();
+        }
+        return 'queued';
+      } catch (error) {
+        setProcessing(false);
+        throw error;
+      }
+    },
+    [apiKeys, channelName, movie, movieId, movieTitle, supabase]
+  );
 
   const fetchMovie = useCallback(async () => {
     setLoading(true);
@@ -66,6 +181,15 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       toast.error('Không thể tải thông tin phim');
     } else if (data) {
       setMovie(data);
+      if (data.title !== movieTitle) {
+        setView({
+          type: 'movie-detail',
+          movieId,
+          movieTitle: data.title,
+          channelId,
+          channelName,
+        });
+      }
       setEditedVietnameseSrt(data.vietnamese_srt || '');
       setEditedDescription(data.ai_description || '');
       if (data.video_url) {
@@ -76,7 +200,7 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       }
     }
     setLoading(false);
-  }, [supabase, movieId]);
+  }, [supabase, movieId, movieTitle, channelId, channelName, setView]);
 
   const fetchJob = useCallback(async () => {
     const { data } = await supabase
@@ -114,9 +238,10 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
   }, [supabase]);
 
   useEffect(() => {
-    fetchMovie();
-    fetchJob();
-    fetchApiKeys();
+    const loadInitialData = async () => {
+      await Promise.all([fetchMovie(), fetchJob(), fetchApiKeys()]);
+    };
+    void loadInitialData();
   }, [fetchMovie, fetchJob, fetchApiKeys]);
 
   // Realtime subscription
@@ -214,7 +339,6 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       toast.error('Kích thước video không được vượt quá 500MB');
       return;
     }
-    setVideoFile(file);
     setVideoUploading(true);
     let videoUploaded = false;
     try {
@@ -234,7 +358,14 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
 
       const { error: updateError } = await supabase
         .from('movies')
-        .update({ video_url: urlData.publicUrl, status: 'draft' })
+        .update({
+          video_url: urlData.publicUrl,
+          status: 'draft',
+          original_srt: null,
+          dubbed_video_url: null,
+          vietnamese_srt: null,
+          ai_description: null,
+        })
         .eq('id', movieId);
       if (updateError) throw updateError;
       videoUploaded = true;
@@ -246,7 +377,7 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
         },
         body: JSON.stringify({
           movieId,
-          movieTitle,
+          movieTitle: movie?.title || movieTitle,
           originalFileName: file.name,
           videoUrl: urlData.publicUrl,
         }),
@@ -263,12 +394,27 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
         .eq('id', movieId);
       if (srtUpdateError) throw srtUpdateError;
 
-      toast.success(`Đã tạo SRT và lưu vào test\\${extractResult.fileName}`);
       fetchMovie();
       setActiveTab('original-srt');
+      const startResult = await startTranslationInternal({
+        videoUrl: urlData.publicUrl,
+        movieOverrides: {
+          ...movie,
+          video_url: urlData.publicUrl,
+          original_srt: extractResult.srt,
+          status: 'translating',
+        },
+      });
+      toast.success(
+        startResult === 'accepted'
+          ? `Đã tải video, tạo SRT và tự động bắt đầu dịch`
+          : 'Đã tải video, tạo SRT. Job dịch sẽ tự chạy khi server online'
+      );
     } catch (error: any) {
       if (videoUploaded) {
-        toast.error(`Video đã tải lên nhưng tạo SRT thất bại: ${error.message || 'Lỗi không xác định'}`);
+        toast.error(
+          `Video đã tải lên nhưng chưa thể chạy hết quy trình: ${error.message || 'Lỗi không xác định'}`
+        );
         fetchMovie();
         setActiveTab('original-srt');
       } else {
@@ -330,7 +476,14 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       // can stay stateless and reusable.)
       const { error: updateError } = await supabase
         .from('movies')
-        .update({ video_url: importResult.videoUrl, status: 'draft' })
+        .update({
+          video_url: importResult.videoUrl,
+          status: 'draft',
+          original_srt: null,
+          dubbed_video_url: null,
+          vietnamese_srt: null,
+          ai_description: null,
+        })
         .eq('id', movieId);
       if (updateError) throw updateError;
 
@@ -341,7 +494,7 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           movieId,
-          movieTitle,
+          movieTitle: movie?.title || movieTitle,
           originalFileName: importResult.filename || 'tiktok-video.mp4',
           videoUrl: importResult.videoUrl,
         }),
@@ -359,18 +512,30 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
         .eq('id', movieId);
       if (srtUpdateError) throw srtUpdateError;
 
-      toast.success(
-        `Đã tải video TikTok và tạo SRT${importResult.title ? `: "${importResult.title.slice(0, 50)}"` : ''}`
-      );
       setTiktokUrl('');
       fetchMovie();
       setActiveTab('original-srt');
+      setTiktokImportStage('Đã tạo SRT. Đang tự động bắt đầu dịch phim...');
+      const startResult = await startTranslationInternal({
+        videoUrl: importResult.videoUrl,
+        movieOverrides: {
+          ...movie,
+          video_url: importResult.videoUrl,
+          original_srt: extractResult.srt,
+          status: 'translating',
+        },
+      });
+      toast.success(
+        startResult === 'accepted'
+          ? `Đã tải video TikTok và tự động bắt đầu dịch${importResult.title ? `: "${importResult.title.slice(0, 50)}"` : ''}`
+          : 'Đã tải video TikTok, tạo SRT. Job dịch sẽ tự chạy khi server online'
+      );
     } catch (error: any) {
       const msg = error.message || 'Lỗi không xác định';
       if (videoUploaded) {
         // Video was downloaded + uploaded to Supabase, but SRT extraction failed.
         // Don't lose the video — show a partial-success toast and switch to SRT tab.
-        toast.error(`Video đã tải lên nhưng tạo SRT thất bại: ${msg}`);
+        toast.error(`Video đã tải lên nhưng chưa thể chạy hết quy trình: ${msg}`);
         fetchMovie();
         setActiveTab('original-srt');
       } else {
@@ -384,80 +549,13 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
     }
   };
 
-  const startTranslation = async () => {
-    if (!movie?.video_url) {
-      toast.error('Vui lòng tải lên video trước');
-      return;
-    }
-    if (!apiKeys.gemini) {
-      toast.error('Vui lòng thêm Gemini API key trong tab API Keys');
-      return;
-    }
-    setProcessing(true);
+  const startTranslation = async (options?: StartTranslationOptions) => {
     try {
-      // Create a new job
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) throw new Error('Chưa đăng nhập');
-
-      const { data: jobData, error: jobError } = await supabase
-        .from('translation_jobs')
-        .insert({
-          movie_id: movieId,
-          user_id: user.id,
-          status: 'pending',
-          progress: 0,
-          current_step: 'Đang khởi tạo',
-        })
-        .select()
-        .single();
-      if (jobError) throw jobError;
-
-      setJob(jobData);
-
-      // Update movie status
-      await supabase
-        .from('movies')
-        .update({ status: 'translating' })
-        .eq('id', movieId);
-
-      // Trigger the translation service via Socket.io.
-      // If the socket is up, emit directly. If not, queue the payload and let
-      // the service's startup recovery (or our reconnect handler) pick it up.
-      const startPayload = {
-        movieId,
-        jobId: jobData.id,
-        videoUrl: movie.video_url,
-        userId: user.id,
-        apiKeys,
-        ttsVoice: movie.tts_voice || 'vi_vn_1',
-        ttsRate: movie.tts_rate || '1.0',
-        ttsVolume: movie.tts_volume ?? 1.0,
-        bgmVolume: movie.bgm_volume ?? 0.03,
-        logoUrl: movie.logo_url || null,
-        movieTitle: movie.title,
-        episode: movie.episode || '',
-        channelName: movieTitle,
-      };
-      if (socketRef.current && socketRef.current.connected) {
-        socketRef.current.emit('start-translation', startPayload, (response: any) => {
-          if (response.status === 'accepted') {
-            toast.success('Đã bắt đầu quá trình dịch phim');
-          } else {
-            toast.error(response.error || 'Không thể bắt đầu dịch');
-            setProcessing(false);
-          }
-        });
+      const result = await startTranslationInternal(options);
+      if (result === 'accepted') {
+        toast.success('Đã bắt đầu quá trình dịch phim');
       } else {
-        // Queue payload; it will be re-emitted on socket 'connect',
-        // and the service's startup recovery will also pick it up
-        // if the service was down and is now starting.
-        pendingStartRef.current = startPayload;
-        toast.warning(
-          'Server dịch chưa sẵn sàng. Job đã lưu, sẽ tự chạy khi server online.'
-        );
-        if (socketRef.current) {
-          socketRef.current.connect();
-        }
+        toast.warning('Server dịch chưa sẵn sàng. Job đã lưu, sẽ tự chạy khi server online.');
       }
     } catch (error: any) {
       setProcessing(false);
@@ -551,6 +649,226 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
 
   const currentStatus = job?.status;
   const progressInfo = currentStatus ? JOB_STATUS_LABELS[currentStatus] : null;
+  const previewVideoUrl =
+    movie?.status === 'completed' && movie?.dubbed_video_url ? movie.dubbed_video_url : movie?.video_url;
+  const previewVideoLabel =
+    movie?.status === 'completed' && movie?.dubbed_video_url ? 'Video lồng tiếng' : 'Video gốc';
+  const previewVideoSrc = buildMediaUrl(
+    previewVideoUrl,
+    movie?.updated_at || movie?.created_at || null
+  );
+  const dubbedVideoSrc = buildMediaUrl(
+    movie?.dubbed_video_url,
+    movie?.updated_at || movie?.created_at || null
+  );
+  const renderVideoSourceManager = () => (
+    <Card className="border-slate-800 bg-slate-900/50">
+      <CardHeader>
+        <CardTitle className="text-white flex items-center gap-2">
+          <Upload className="w-5 h-5 text-rose-400" />
+          Nguon video
+        </CardTitle>
+        <CardDescription className="text-slate-400">
+          Upload video tu may hoac dan link TikTok de tai ve ngay trong phim nay
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {!movie.video_url ? (
+          <div className="space-y-4">
+            <div
+              className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center hover:border-rose-500/50 transition-colors cursor-pointer"
+              onClick={() => document.getElementById('video-input')?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                e.currentTarget.classList.add('border-rose-500', 'bg-rose-500/5');
+              }}
+              onDragLeave={(e) => {
+                e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
+                const file = e.dataTransfer.files[0];
+                if (file) handleVideoUpload(file);
+              }}
+            >
+              {videoUploading ? (
+                <>
+                  <Loader2 className="w-12 h-12 mx-auto mb-3 text-rose-400 animate-spin" />
+                  <p className="text-white font-medium">Dang tai len...</p>
+                  <p className="text-xs text-slate-500 mt-1">Vui long doi</p>
+                </>
+              ) : (
+                <>
+                  <Video className="w-12 h-12 mx-auto mb-3 text-slate-600" />
+                  <p className="text-white font-medium mb-1">
+                    Keo tha video hoac click de chon
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    MP4, WebM, MOV - Toi da 500MB
+                  </p>
+                </>
+              )}
+              <input
+                id="video-input"
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) handleVideoUpload(file);
+                }}
+              />
+            </div>
+
+            <div className="flex items-center gap-3">
+              <div className="flex-1 h-px bg-slate-700" />
+              <span className="text-xs text-slate-500 uppercase tracking-wider">Hoac</span>
+              <div className="flex-1 h-px bg-slate-700" />
+            </div>
+
+            <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30">
+              <div className="flex items-center gap-2 mb-3">
+                <LinkIcon className="w-4 h-4 text-rose-400" />
+                <p className="text-sm text-white font-medium">Tai video tu link TikTok</p>
+              </div>
+              <p className="text-xs text-slate-400 mb-3">
+                Dan link TikTok (vt.tiktok.com/..., www.tiktok.com/@user/video/...) de he thong tu tai video ve va trich xuat SRT.
+              </p>
+              {tiktokImporting ? (
+                <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
+                  <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-white font-medium truncate">
+                      {tiktokImportStage || 'Dang xu ly...'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Co the mat 30-120 giay tuy do dai video
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <input
+                    type="url"
+                    value={tiktokUrl}
+                    onChange={(e) => setTiktokUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && tiktokUrl.trim()) {
+                        e.preventDefault();
+                        handleTiktokImport();
+                      }
+                    }}
+                    placeholder="https://vt.tiktok.com/ZS42guBnS/"
+                    className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    disabled={tiktokImporting || videoUploading}
+                  />
+                  <Button
+                    onClick={handleTiktokImport}
+                    disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
+                    className="bg-rose-600 hover:bg-rose-700 text-white"
+                  >
+                    <LinkIcon className="w-4 h-4 mr-1" />
+                    Tai video
+                  </Button>
+                </div>
+              )}
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
+              <CheckCircle2 className="w-5 h-5 text-green-500" />
+              <div className="flex-1 min-w-0">
+                <p className="text-sm text-white font-medium">Da co video cho phim nay</p>
+                <p className="text-xs text-slate-400 truncate">
+                  Ban van co the upload file moi hoac dan link TikTok de thay the
+                </p>
+              </div>
+            </div>
+
+            <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30 space-y-3">
+              <p className="text-xs text-slate-400 font-medium uppercase tracking-wider">
+                Doi video
+              </p>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => document.getElementById('video-input-replace')?.click()}
+                  className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
+                  disabled={tiktokImporting || videoUploading}
+                >
+                  <RefreshCw className="w-3 h-3 mr-1" />
+                  Chon file tu may
+                </Button>
+                <input
+                  id="video-input-replace"
+                  type="file"
+                  accept="video/*"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) handleVideoUpload(file);
+                  }}
+                />
+              </div>
+              {tiktokImporting ? (
+                <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
+                  <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm text-white font-medium truncate">
+                      {tiktokImportStage || 'Dang xu ly...'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Co the mat 30-120 giay tuy do dai video
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="flex gap-2">
+                  <input
+                    type="url"
+                    value={tiktokUrl}
+                    onChange={(e) => setTiktokUrl(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && tiktokUrl.trim()) {
+                        e.preventDefault();
+                        handleTiktokImport();
+                      }
+                    }}
+                    placeholder="Hoac dan link TikTok de thay the..."
+                    className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
+                    disabled={tiktokImporting || videoUploading}
+                  />
+                  <Button
+                    onClick={handleTiktokImport}
+                    disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
+                    className="bg-rose-600 hover:bg-rose-700 text-white"
+                  >
+                    <LinkIcon className="w-4 h-4 mr-1" />
+                    Tai video
+                  </Button>
+                </div>
+              )}
+            </div>
+
+            {!apiKeys.gemini && (
+              <div className="flex items-center gap-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                <AlertCircle className="w-5 h-5 text-yellow-500" />
+                <div className="flex-1">
+                  <p className="text-sm text-white font-medium">Chua co Gemini API key</p>
+                  <p className="text-xs text-slate-400">
+                    Vui long them API key trong tab API Keys de dich phim
+                  </p>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 
   return (
     <div className="p-6 space-y-6">
@@ -562,26 +880,38 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
             <p className="text-sm text-slate-400 mt-1">Tập {movie.episode}</p>
           )}
         </div>
-        {movie.video_url && (
+        <div className="flex items-center gap-2">
           <Button
-            onClick={startTranslation}
-            disabled={processing}
-            className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600"
+            variant="outline"
+            onClick={() => setEditorOpen(true)}
+            className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
           >
-            {processing ? (
-              <>
-                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                Đang xử lý...
-              </>
-            ) : (
-              <>
-                <Wand2 className="w-4 h-4 mr-2" />
-                {movie.status === 'completed' ? 'Dịch lại' : 'Bắt đầu dịch phim'}
-              </>
-            )}
+            <Pencil className="w-4 h-4 mr-2" />
+            Chỉnh sửa phim
           </Button>
-        )}
+          {movie.video_url && (
+            <Button
+              onClick={startTranslation}
+              disabled={processing}
+              className="bg-gradient-to-r from-rose-500 to-orange-500 hover:from-rose-600 hover:to-orange-600"
+            >
+              {processing ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Đang xử lý...
+                </>
+              ) : (
+                <>
+                  <Wand2 className="w-4 h-4 mr-2" />
+                  {movie.status === 'completed' ? 'Dịch lại' : 'Bắt đầu dịch phim'}
+                </>
+              )}
+            </Button>
+          )}
+        </div>
       </div>
+
+      {renderVideoSourceManager()}
 
       {/* Progress Bar */}
       {(processing || (currentStatus && currentStatus !== 'completed' && currentStatus !== 'failed')) && (
@@ -616,12 +946,13 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
       )}
 
       {/* Video Preview - Always visible at top if video exists */}
-      {movie.video_url && (
+      {movie.video_url && previewVideoSrc && (
         <Card className="border-slate-800 bg-slate-900/50 overflow-hidden">
           <CardContent className="p-0">
             <div className="aspect-video bg-black">
               <video
-                src={movie.dubbed_video_url || movie.video_url}
+                key={previewVideoSrc}
+                src={previewVideoSrc}
                 controls
                 className="w-full h-full"
                 poster={movie.thumbnail_url || undefined}
@@ -630,10 +961,10 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
             <div className="p-3 flex items-center justify-between bg-slate-900/80 border-t border-slate-800">
               <div className="flex items-center gap-2 text-xs text-slate-400">
                 <Video className="w-4 h-4" />
-                <span>{movie.dubbed_video_url ? 'Video lồng tiếng' : 'Video gốc'}</span>
+                <span>{previewVideoLabel}</span>
               </div>
               <div className="flex items-center gap-2">
-                {movie.dubbed_video_url && (
+                {movie.status === 'completed' && movie.dubbed_video_url && (
                   <>
                     <Button size="sm" variant="ghost" asChild>
                       <a href={movie.dubbed_video_url} download className="text-slate-300 hover:text-white">
@@ -662,11 +993,11 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
 
       {/* Tabs */}
       <Tabs value={activeTab} onValueChange={setActiveTab}>
-        <TabsList className="grid w-full grid-cols-3 sm:grid-cols-6 bg-slate-900/50 h-auto">
+        <TabsList className="grid w-full grid-cols-2 sm:grid-cols-5 bg-slate-900/50 h-auto">
           <TabTrigger
-            value="upload"
-            icon={Upload}
-            label="Upload"
+            value="info"
+            icon={Film}
+            label="Thông tin"
             disabled={false}
           />
           <TabTrigger
@@ -693,230 +1024,7 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
             label="Mô Tả"
             disabled={!movie.vietnamese_srt}
           />
-          <TabTrigger
-            value="info"
-            icon={Film}
-            label="Thông tin"
-            disabled={false}
-          />
         </TabsList>
-
-        {/* Upload Tab */}
-        <TabsContent value="upload" className="mt-4">
-          <Card className="border-slate-800 bg-slate-900/50">
-            <CardHeader>
-              <CardTitle className="text-white flex items-center gap-2">
-                <Upload className="w-5 h-5 text-rose-400" />
-                Tải lên video
-              </CardTitle>
-              <CardDescription className="text-slate-400">
-                Tải lên video từ máy hoặc dán link TikTok để tự động tải về
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              {!movie.video_url ? (
-                <div className="space-y-4">
-                  {/* File upload (drag-drop + click) */}
-                  <div
-                    className="border-2 border-dashed border-slate-700 rounded-lg p-8 text-center hover:border-rose-500/50 transition-colors cursor-pointer"
-                    onClick={() => document.getElementById('video-input')?.click()}
-                    onDragOver={(e) => {
-                      e.preventDefault();
-                      e.currentTarget.classList.add('border-rose-500', 'bg-rose-500/5');
-                    }}
-                    onDragLeave={(e) => {
-                      e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
-                    }}
-                    onDrop={(e) => {
-                      e.preventDefault();
-                      e.currentTarget.classList.remove('border-rose-500', 'bg-rose-500/5');
-                      const file = e.dataTransfer.files[0];
-                      if (file) handleVideoUpload(file);
-                    }}
-                  >
-                    {videoUploading ? (
-                      <>
-                        <Loader2 className="w-12 h-12 mx-auto mb-3 text-rose-400 animate-spin" />
-                        <p className="text-white font-medium">Đang tải lên...</p>
-                        <p className="text-xs text-slate-500 mt-1">Vui lòng đợi</p>
-                      </>
-                    ) : (
-                      <>
-                        <Video className="w-12 h-12 mx-auto mb-3 text-slate-600" />
-                        <p className="text-white font-medium mb-1">
-                          Kéo thả video hoặc click để chọn
-                        </p>
-                        <p className="text-xs text-slate-500">
-                          MP4, WebM, MOV - Tối đa 500MB
-                        </p>
-                      </>
-                    )}
-                    <input
-                      id="video-input"
-                      type="file"
-                      accept="video/*"
-                      className="hidden"
-                      onChange={(e) => {
-                        const file = e.target.files?.[0];
-                        if (file) handleVideoUpload(file);
-                      }}
-                    />
-                  </div>
-
-                  {/* OR divider */}
-                  <div className="flex items-center gap-3">
-                    <div className="flex-1 h-px bg-slate-700" />
-                    <span className="text-xs text-slate-500 uppercase tracking-wider">Hoặc</span>
-                    <div className="flex-1 h-px bg-slate-700" />
-                  </div>
-
-                  {/* TikTok URL import */}
-                  <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30">
-                    <div className="flex items-center gap-2 mb-3">
-                      <LinkIcon className="w-4 h-4 text-rose-400" />
-                      <p className="text-sm text-white font-medium">Tải video từ link TikTok</p>
-                    </div>
-                    <p className="text-xs text-slate-400 mb-3">
-                      Dán link TikTok (vt.tiktok.com/..., www.tiktok.com/@user/video/...) —
-                      server sẽ tự tải video, lưu vào storage, và trích xuất SRT.
-                    </p>
-                    {tiktokImporting ? (
-                      <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
-                        <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm text-white font-medium truncate">
-                            {tiktokImportStage || 'Đang xử lý...'}
-                          </p>
-                          <p className="text-xs text-slate-400 mt-0.5">
-                            Có thể mất 30-120 giây tùy độ dài video
-                          </p>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex gap-2">
-                        <input
-                          type="url"
-                          value={tiktokUrl}
-                          onChange={(e) => setTiktokUrl(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && tiktokUrl.trim()) {
-                              e.preventDefault();
-                              handleTiktokImport();
-                            }
-                          }}
-                          placeholder="https://vt.tiktok.com/ZS42guBnS/"
-                          className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
-                          disabled={tiktokImporting || videoUploading}
-                        />
-                        <Button
-                          onClick={handleTiktokImport}
-                          disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
-                          className="bg-rose-600 hover:bg-rose-700 text-white"
-                        >
-                          <LinkIcon className="w-4 h-4 mr-1" />
-                          Tải video
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <div className="flex items-center gap-3 p-3 bg-green-500/10 border border-green-500/30 rounded-lg">
-                    <CheckCircle2 className="w-5 h-5 text-green-500" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-white font-medium">Đã tải lên video</p>
-                      <p className="text-xs text-slate-400 truncate">
-                        Sẵn sàng để bắt đầu dịch — hoặc đổi video bên dưới
-                      </p>
-                    </div>
-                  </div>
-
-                  {/* Replace video: file upload OR TikTok URL */}
-                  <div className="border border-slate-700 rounded-lg p-4 bg-slate-800/30 space-y-3">
-                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wider">
-                      Đổi video
-                    </p>
-                    {/* File upload button */}
-                    <div className="flex gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() => document.getElementById('video-input-replace')?.click()}
-                        className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
-                        disabled={tiktokImporting || videoUploading}
-                      >
-                        <RefreshCw className="w-3 h-3 mr-1" />
-                        Chọn file từ máy
-                      </Button>
-                      <input
-                        id="video-input-replace"
-                        type="file"
-                        accept="video/*"
-                        className="hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (file) handleVideoUpload(file);
-                        }}
-                      />
-                    </div>
-                    {/* TikTok URL import */}
-                    {tiktokImporting ? (
-                      <div className="flex items-center gap-3 p-3 bg-rose-500/10 border border-rose-500/30 rounded-lg">
-                        <Loader2 className="w-5 h-5 text-rose-400 animate-spin flex-shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm text-white font-medium truncate">
-                            {tiktokImportStage || 'Đang xử lý...'}
-                          </p>
-                          <p className="text-xs text-slate-400 mt-0.5">
-                            Có thể mất 30-120 giây tùy độ dài video
-                          </p>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex gap-2">
-                        <input
-                          type="url"
-                          value={tiktokUrl}
-                          onChange={(e) => setTiktokUrl(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter' && tiktokUrl.trim()) {
-                              e.preventDefault();
-                              handleTiktokImport();
-                            }
-                          }}
-                          placeholder="Hoặc dán link TikTok để thay thế..."
-                          className="flex-1 px-3 py-2 text-sm bg-slate-900 border border-slate-700 rounded-md text-white placeholder:text-slate-500 focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500"
-                          disabled={tiktokImporting || videoUploading}
-                        />
-                        <Button
-                          onClick={handleTiktokImport}
-                          disabled={!tiktokUrl.trim() || tiktokImporting || videoUploading}
-                          className="bg-rose-600 hover:bg-rose-700 text-white"
-                        >
-                          <LinkIcon className="w-4 h-4 mr-1" />
-                          Tải video
-                        </Button>
-                      </div>
-                    )}
-                  </div>
-
-                  {!apiKeys.gemini && (
-                    <div className="flex items-center gap-3 p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
-                      <AlertCircle className="w-5 h-5 text-yellow-500" />
-                      <div className="flex-1">
-                        <p className="text-sm text-white font-medium">Chưa có Gemini API key</p>
-                        <p className="text-xs text-slate-400">
-                          Vui lòng thêm API key trong tab API Keys để dịch phim
-                        </p>
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
 
         {/* Original SRT Tab */}
         <TabsContent value="original-srt" className="mt-4">
@@ -1025,7 +1133,8 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
                 <div className="space-y-3">
                   <div className="aspect-video bg-black rounded-lg overflow-hidden">
                     <video
-                      src={movie.dubbed_video_url}
+                      key={dubbedVideoSrc}
+                      src={dubbedVideoSrc}
                       controls
                       className="w-full h-full"
                       poster={movie.thumbnail_url || undefined}
@@ -1171,6 +1280,24 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
           </Card>
         </TabsContent>
       </Tabs>
+
+      <MovieEditorDialog
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        channelId={channelId}
+        movie={movie}
+        onSaved={(savedMovie) => {
+          setMovie(savedMovie);
+          setView({
+            type: 'movie-detail',
+            movieId: savedMovie.id,
+            movieTitle: savedMovie.title,
+            channelId,
+            channelName,
+          });
+          fetchMovie();
+        }}
+      />
     </div>
   );
 }

@@ -83,6 +83,7 @@ export default function Home() {
           movieId={view.movieId}
           movieTitle={view.movieTitle}
           channelId={view.channelId}
+          channelName={view.channelName}
         />
       )}
       {view.type === 'api-keys' && <ApiKeyManager />}

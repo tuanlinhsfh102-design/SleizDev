@@ -3,7 +3,7 @@ import { create } from 'zustand';
 export type ViewType =
   | { type: 'channels' }
   | { type: 'channel-detail'; channelId: string; channelName: string }
-  | { type: 'movie-detail'; movieId: string; movieTitle: string; channelId: string }
+  | { type: 'movie-detail'; movieId: string; movieTitle: string; channelId: string; channelName: string }
   | { type: 'api-keys' };
 
 interface AppState {
