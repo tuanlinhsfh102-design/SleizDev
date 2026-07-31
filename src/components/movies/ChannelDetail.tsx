@@ -86,6 +86,7 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
     tts_rate: '1.0',
     tts_volume: 1.0,
     bgm_volume: 0.03,
+    logo_url: '' as string | null,
   });
 
   const fetchMovies = useCallback(async () => {
@@ -118,6 +119,7 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
       tts_rate: '1.0',
       tts_volume: 1.0,
       bgm_volume: 0.03,
+      logo_url: null,
     });
     setDialogOpen(true);
   };
@@ -133,6 +135,7 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
       tts_rate: movie.tts_rate || '1.0',
       tts_volume: movie.tts_volume ?? 1.0,
       bgm_volume: movie.bgm_volume ?? 0.03,
+      logo_url: movie.logo_url || null,
     });
     setDialogOpen(true);
   };
@@ -171,6 +174,42 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
     }
   };
 
+  const [logoUploading, setLogoUploading] = useState(false);
+
+  const handleLogoUpload = async (file: File) => {
+    if (!file.type.startsWith('image/')) {
+      toast.error('Vui lòng chọn file ảnh (PNG khuyến nghị)');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      toast.error('Kích thước logo không được vượt quá 5MB');
+      return;
+    }
+    setLogoUploading(true);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) throw new Error('Chưa đăng nhập');
+
+      const ext = file.name.split('.').pop();
+      const fileName = `${user.id}/${channelId}/logo-${Date.now()}.${ext}`;
+      const { error } = await supabase.storage
+        .from('thumbnails')
+        .upload(fileName, file, { upsert: true });
+      if (error) throw error;
+
+      const { data: urlData } = supabase.storage
+        .from('thumbnails')
+        .getPublicUrl(fileName);
+
+      setFormData((prev) => ({ ...prev, logo_url: urlData.publicUrl }));
+      toast.success('Tải logo lên thành công');
+    } catch (error: any) {
+      toast.error(error.message || 'Tải logo thất bại');
+    } finally {
+      setLogoUploading(false);
+    }
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formData.title.trim()) {
@@ -191,6 +230,7 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
             tts_rate: formData.tts_rate,
             tts_volume: formData.tts_volume,
             bgm_volume: formData.bgm_volume,
+            logo_url: formData.logo_url || null,
           })
           .eq('id', editingMovie.id);
         if (error) throw error;
@@ -207,6 +247,7 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
             tts_rate: formData.tts_rate,
             tts_volume: formData.tts_volume,
             bgm_volume: formData.bgm_volume,
+            logo_url: formData.logo_url || null,
             channel_id: channelId,
             status: 'draft',
           });
@@ -600,6 +641,91 @@ export function ChannelDetail({ channelId, channelName }: ChannelDetailProps) {
                   <span>50% (to)</span>
                 </div>
               </div>
+            </div>
+
+            {/* Logo overlay (optional — adds logo to top-left corner of dubbed video) */}
+            <div className="space-y-3 p-3 bg-slate-800/50 rounded-lg border border-slate-700">
+              <div className="flex items-center gap-2 text-sm text-slate-200 font-medium">
+                <ImagePlus className="w-4 h-4 text-rose-400" />
+                Logo (tùy chọn)
+              </div>
+              <p className="text-xs text-slate-400">
+                Tải logo PNG (nền trong suốt) — sẽ hiển thị ở góc trên bên trái video lồng tiếng.
+                Bỏ trống nếu không muốn logo.
+              </p>
+
+              {formData.logo_url ? (
+                <div className="flex items-center gap-3">
+                  <div className="w-24 h-12 bg-slate-900 border border-slate-700 rounded flex items-center justify-center overflow-hidden">
+                    <img
+                      src={formData.logo_url}
+                      alt="Logo preview"
+                      className="max-w-full max-h-full object-contain"
+                    />
+                  </div>
+                  <div className="flex gap-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => document.getElementById('logo-input-replace')?.click()}
+                      disabled={logoUploading}
+                      className="bg-slate-800 border-slate-700 text-white hover:bg-slate-700"
+                    >
+                      {logoUploading ? <Loader2 className="w-3 h-3 mr-1 animate-spin" /> : <RefreshCw className="w-3 h-3 mr-1" />}
+                      Đổi logo
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setFormData({ ...formData, logo_url: null })}
+                      disabled={logoUploading}
+                      className="bg-slate-800 border-slate-700 text-red-400 hover:bg-slate-700"
+                    >
+                      <Trash2 className="w-3 h-3 mr-1" />
+                      Xóa logo
+                    </Button>
+                  </div>
+                  <input
+                    id="logo-input-replace"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleLogoUpload(file);
+                    }}
+                  />
+                </div>
+              ) : (
+                <div
+                  className="border-2 border-dashed border-slate-700 rounded-lg p-4 text-center hover:border-rose-500/50 transition-colors cursor-pointer"
+                  onClick={() => document.getElementById('logo-input')?.click()}
+                >
+                  {logoUploading ? (
+                    <>
+                      <Loader2 className="w-6 h-6 mx-auto mb-1 text-rose-400 animate-spin" />
+                      <p className="text-xs text-slate-400">Đang tải...</p>
+                    </>
+                  ) : (
+                    <>
+                      <ImagePlus className="w-6 h-6 mx-auto mb-1 text-slate-600" />
+                      <p className="text-xs text-slate-400">Click để chọn logo (PNG khuyến nghị)</p>
+                    </>
+                  )}
+                  <input
+                    id="logo-input"
+                    type="file"
+                    accept="image/png,image/jpeg,image/webp"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) handleLogoUpload(file);
+                    }}
+                  />
+                </div>
+              )}
             </div>
 
             <DialogFooter>

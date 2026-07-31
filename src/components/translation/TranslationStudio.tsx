@@ -433,6 +433,7 @@ export function TranslationStudio({ movieId, movieTitle }: TranslationStudioProp
         ttsRate: movie.tts_rate || '1.0',
         ttsVolume: movie.tts_volume ?? 1.0,
         bgmVolume: movie.bgm_volume ?? 0.03,
+        logoUrl: movie.logo_url || null,
         movieTitle: movie.title,
         episode: movie.episode || '',
         channelName: movieTitle,

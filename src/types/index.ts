@@ -30,6 +30,8 @@ export interface Movie {
   tts_volume: number | null;
   /** Original audio (background) volume in final mix (0.0 = muted, 0.03 = 3% ambience, 0.1 = 10%). Default 0.03. */
   bgm_volume: number | null;
+  /** Optional logo image URL (PNG with transparency). If set, the logo is overlaid in the top-left corner of the dubbed video. */
+  logo_url: string | null;
   created_at: string;
   updated_at: string;
 }

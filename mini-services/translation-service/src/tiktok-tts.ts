@@ -700,11 +700,15 @@ export async function dubVideo(
   outputPath: string,
   originalVolume = 0.03, // Keep original audio at 3% volume as background ambience
   /** Volume of the TTS audio track in the final mix. Default 1.0 (full). Range: 0.0 - 1.5. */
-  ttsVolume = 1.0
+  ttsVolume = 1.0,
+  /** Optional path to a logo image (PNG with transparency). If provided, the logo is overlaid in the top-left corner of the output video. The logo is scaled to ~12% of the video width and positioned with 2% padding from the top-left edge. */
+  logoPath?: string | null
 ): Promise<void> {
   console.log(
     `[ffmpeg] Dubbing video with new audio + 16:9 auto-crop ` +
-      `(TTS: ${(ttsVolume * 100).toFixed(0)}%, original: ${(originalVolume * 100).toFixed(0)}%)...`
+      `(TTS: ${(ttsVolume * 100).toFixed(0)}%, original: ${(originalVolume * 100).toFixed(0)}%)` +
+      (logoPath ? ` + logo overlay` : '') +
+      `...`
   );
 
   // 1. Detect crop box
@@ -736,10 +740,37 @@ export async function dubVideo(
   console.log(`[crop] Source audio: ${hasSourceAudio ? 'present' : 'absent'}`);
 
   // 6. Build the filter_complex string.
-  //    - Video: always [0:v] -> crop+scale+pad -> [v]
-  //    - Audio: if source has audio, mix [0:a] at originalVolume + [1:a] at 1.0
-  //             if source has no audio, just take [1:a] at 1.0
-  const labeledVideoFilter = `[0:v]${videoFilter}[v]`;
+  //    - Video: [0:v] -> crop+scale+pad -> [vcropped]
+  //    - Logo (optional): [2:v] -> scale -> overlay on [vcropped] at top-left -> [v]
+  //    - Audio: if source has audio, mix [0:a] at originalVolume + [1:a] at ttsVolume
+  //             if source has no audio, just take [1:a] at ttsVolume
+  //
+  // CRITICAL: Logo overlay is applied AFTER crop+scale+pad so the logo
+  // position is relative to the final output resolution, not the source.
+  // The logo is scaled to ~12% of the output width and positioned with
+  // ~2% padding from the top-left corner.
+  const useLogo = logoPath && fs.existsSync(logoPath);
+  let videoOutputLabel = 'v';
+  let logoInputArg = '';
+  let logoFilterPart = '';
+
+  if (useLogo) {
+    // Add a third input for the logo image
+    logoInputArg = `-i "${logoPath}"`;
+    // Scale logo to 12% of target width, preserving aspect ratio
+    const logoWidth = Math.round(target.w * 0.12);
+    const padding = Math.round(target.w * 0.02); // 2% padding from edge
+    // [0:v]crop+scale+pad -> [vcropped]
+    // [2:v]scale logo to logoWidth:-1 (preserve aspect) -> [logo]
+    // [vcropped][logo]overlay=x=padding:y=padding -> [v]
+    logoFilterPart =
+      `;[2:v]scale=${logoWidth}:-1[logo];` +
+      `[vcropped][logo]overlay=x=${padding}:y=${padding}[v]`;
+    videoOutputLabel = 'vcropped';
+    console.log(`[logo] Adding logo overlay: ${logoPath} (scaled to ${logoWidth}px wide, ${padding}px from top-left)`);
+  }
+
+  const labeledVideoFilter = `[0:v]${videoFilter}[${videoOutputLabel}]${logoFilterPart}`;
   let audioFilter: string;
   let mapArgs: string;
 
@@ -756,7 +787,7 @@ export async function dubVideo(
 
   const fullFilter = `${labeledVideoFilter};${audioFilter}`;
   const finalCmd =
-    `"${FFMPEG_PATH}" -i "${videoPath}" -i "${audioPath}" ` +
+    `"${FFMPEG_PATH}" -i "${videoPath}" -i "${audioPath}" ${logoInputArg} ` +
     `-filter_complex "${fullFilter}" ` +
     `${mapArgs} ` +
     `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +

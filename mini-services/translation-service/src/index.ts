@@ -106,6 +106,8 @@ interface TranslationParams {
   ttsVolume?: number;
   /** Original audio (background) volume in final mix (0.0 - 0.5). Default 0.03. */
   bgmVolume?: number;
+  /** Optional logo image URL (PNG with transparency). If set, the logo is overlaid in the top-left corner of the dubbed video. */
+  logoUrl?: string | null;
   movieTitle: string;
   episode: string;
   channelName: string;
@@ -299,9 +301,11 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
   const ttsRate = params.ttsRate || '1.0';
   const ttsVolume = params.ttsVolume ?? 1.0;
   const bgmVolume = params.bgmVolume ?? 0.03;
+  const logoUrl = params.logoUrl || null;
   console.log(
     `[pipeline] Audio settings: voice=${ttsVoice} rate=${ttsRate} ` +
-      `tts_volume=${(ttsVolume * 100).toFixed(0)}% bgm_volume=${(bgmVolume * 100).toFixed(0)}%`
+      `tts_volume=${(ttsVolume * 100).toFixed(0)}% bgm_volume=${(bgmVolume * 100).toFixed(0)}%` +
+      (logoUrl ? ` logo=${logoUrl.slice(0, 60)}...` : ' logo=none')
   );
 
   // Resolve Supabase client up-front so we get a clear actionable error
@@ -378,10 +382,33 @@ async function processTranslation(params: TranslationParams, socket?: Socket) {
     // Step 6: Dub the video (replace original audio with Vietnamese TTS audio)
     // bgmVolume = original Chinese audio level (background ambience, default 3%).
     // ttsVolume = Vietnamese TTS audio level (default 100%).
-    // Both come from the movie record (set via the create/edit dialog sliders).
+    // logoUrl = optional logo to overlay in top-left corner (after crop).
+    // All come from the movie record (set via the create/edit dialog).
     await updateJobProgress(jobId, movieId, 'dubbing', 78, 'Đang lồng tiếng vào video...', socket);
     const dubbedVideoPath = path.join(workDir, 'dubbed.mp4');
-    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, bgmVolume, ttsVolume);
+
+    // Download logo if provided (logo URL is a Supabase Storage public URL)
+    let logoPath: string | null = null;
+    if (logoUrl) {
+      try {
+        logoPath = path.join(workDir, 'logo.png');
+        console.log(`[pipeline] Downloading logo: ${logoUrl.slice(0, 60)}...`);
+        const logoResp = await fetch(logoUrl);
+        if (logoResp.ok) {
+          const logoBuffer = Buffer.from(await logoResp.arrayBuffer());
+          fs.writeFileSync(logoPath, logoBuffer);
+          console.log(`[pipeline] Logo downloaded: ${logoBuffer.length} bytes -> ${logoPath}`);
+        } else {
+          console.warn(`[pipeline] Logo download failed: HTTP ${logoResp.status}`);
+          logoPath = null;
+        }
+      } catch (err: any) {
+        console.warn(`[pipeline] Logo download error: ${err.message}`);
+        logoPath = null;
+      }
+    }
+
+    await dubVideo(videoPath, fullAudioPath, dubbedVideoPath, bgmVolume, ttsVolume, logoPath);
 
     // Step 6.5: Burn Vietnamese subtitles into the video (chèn chữ vào video)
     // This renders the SRT text directly onto the video frames, so the
@@ -562,10 +589,10 @@ async function recoverPendingJobs() {
   for (const job of pendingJobs) {
     try {
       // Fetch the movie to get video_url, tts_voice, tts_rate, tts_volume,
-      // bgm_volume, title, episode
+      // bgm_volume, logo_url, title, episode
       const { data: movie } = await supabase
         .from('movies')
-        .select('id, title, episode, video_url, tts_voice, tts_rate, tts_volume, bgm_volume, channel_id')
+        .select('id, title, episode, video_url, tts_voice, tts_rate, tts_volume, bgm_volume, logo_url, channel_id')
         .eq('id', job.movie_id)
         .single();
       if (!movie?.video_url) {
@@ -605,6 +632,7 @@ async function recoverPendingJobs() {
           ttsRate: movie.tts_rate || '1.0',
           ttsVolume: movie.tts_volume ?? 1.0,
           bgmVolume: movie.bgm_volume ?? 0.03,
+          logoUrl: movie.logo_url || null,
           movieTitle: movie.title,
           episode: movie.episode || '',
           channelName: '',
